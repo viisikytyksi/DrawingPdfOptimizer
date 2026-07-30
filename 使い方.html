@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>図面PDF最適化 使い方</title>
+<style>
+  /* オフラインPCで開くため、外部ファイルは一切参照しない */
+  body{font-family:"Meiryo","Yu Gothic UI",sans-serif;line-height:1.8;color:#222;
+       max-width:760px;margin:0 auto;padding:24px 20px 60px;}
+  h1{font-size:22px;border-bottom:3px solid #1a5490;padding-bottom:8px;margin-bottom:6px;}
+  h2{font-size:17px;color:#1a5490;border-left:6px solid #1a5490;padding-left:10px;margin:30px 0 6px;}
+  p{margin:6px 0;}
+  ol,ul{margin:6px 0 6px 1.4em;padding:0;}
+  li{margin:4px 0;}
+  .lead{color:#555;font-size:14px;margin-bottom:16px;}
+  .what{background:#eef4fa;border-left:5px solid #1a5490;padding:10px 14px;margin:12px 0;}
+  .note{background:#fff8e1;border-left:5px solid #e0a800;padding:10px 14px;margin:12px 0;font-size:14px;}
+  .warn{background:#fdecea;border-left:5px solid #c62828;padding:10px 14px;margin:12px 0;font-size:14px;}
+  code{background:#f0f0f0;padding:2px 6px;border-radius:3px;
+       font-family:"Consolas","MS Gothic",monospace;font-size:13px;}
+  .file{font-weight:bold;background:#e8f5e9;padding:3px 8px;border-radius:3px;
+        font-family:"Consolas","MS Gothic",monospace;border:1px solid #a5d6a7;}
+  footer{margin-top:44px;padding-top:12px;border-top:1px solid #ddd;font-size:13px;color:#666;}
+  @media print{body{max-width:none;}}
+</style>
+</head>
+<body>
+
+<h1>図面PDF最適化　使い方</h1>
+<p class="lead">スキャンした図面PDFを、白黒くっきり・軽量にするツールです。インストールは不要です。</p>
+
+<div class="what">
+  <strong>できること</strong><br>
+  青焼き図面をスキャンしたPDFの<strong>画像部分だけを白黒くっきりにして、ファイルを大幅に軽く</strong>します。CADで書き足した線や文字はそのまま残ります。<br>
+  同時に、<strong>作成者名などのファイル情報（メタデータ）を消します</strong>。公告に載せるPDF向けの既定です。
+</div>
+
+<h2>使い方（かんたん）</h2>
+<ol>
+  <li>PDFファイルを <span class="file">Start.exe</span> の上に<strong>ドラッグ＆ドロップ</strong>します。</li>
+  <li>そのまま処理が始まります。終わるまで待ちます。</li>
+</ol>
+
+<h2>使い方（設定を変えたいとき）</h2>
+<ol>
+  <li><span class="file">Start.cmd</span> をダブルクリックすると設定画面が開きます。</li>
+  <li>PDFを追加します。複数まとめて処理できます。</li>
+  <li>解像度を選びます。<strong>迷ったら既定の300dpi</strong>のままで構いません。
+    <ul>
+      <li>200dpi … いちばん軽い。細かい文字はつぶれることがある</li>
+      <li>300dpi … 標準。A3印刷でおおむね問題ない</li>
+      <li>400dpi … 細部を残したいとき。ファイルは重くなる</li>
+    </ul>
+  </li>
+  <li>開始します。</li>
+</ol>
+
+<div class="note">
+  <strong>元のPDFは書き換わりません。</strong>同じ場所に <code>〜_2値化.pdf</code> という別のファイルができます。<br>
+  実測では 55MB のファイルが 10MB になりました（47ページ・画像702件）。
+</div>
+
+<h2>メタデータの削除について</h2>
+<p>既定で、PDFに埋め込まれた次の情報を消します。</p>
+<ul>
+  <li>タイトル、作成者、件名、キーワード</li>
+  <li>作成したソフト名、作成日時・更新日時</li>
+</ul>
+<p>残したい場合は、設定画面の「PDFメタデータを削除」のチェックを外してください。</p>
+
+<div class="warn">
+  <strong>消えないものもあります。</strong>注釈、添付ファイル、フォームの入力値、レイヤー名、図面上に描かれている文字（表題欄の氏名など）、ファイル名は対象外です。<strong>公開前に、できあがったPDFを目で確認してください。</strong>
+</div>
+
+<h2>納品・公告に使う前に</h2>
+<div class="warn">
+  できあがったPDFを<strong>A3で試し刷り</strong>し、次を確認してください。図面によって仕上がりが変わります。
+  <ul>
+    <li>細い線が消えていないか</li>
+    <li>図の位置がずれていないか</li>
+    <li>ページ数が合っているか</li>
+  </ul>
+</div>
+
+<h2>困ったときは</h2>
+<ul>
+  <li><strong>ファイルが軽くならない</strong> … 元のPDFに画像が含まれていない（すべてベクトルデータ）場合、このツールでは軽くなりません。</li>
+  <li><strong>文字までつぶれた</strong> … 解像度を400dpiに上げて試してください。</li>
+  <li><strong>処理が終わらない</strong> … ページ数と画像数が多いと時間がかかります。数十ページなら数分が目安です。</li>
+</ul>
+
+<p>解決しない場合は、<strong>操作した手順と画面に出たメッセージ</strong>を控えて、配布元へ連絡してください。</p>
+
+<footer>図面PDF最適化　簡易マニュアル</footer>
+
+</body>
+</html>

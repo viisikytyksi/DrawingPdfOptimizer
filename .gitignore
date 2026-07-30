@@ -1,0 +1,23 @@
+# 同梱ポータブルPythonランタイム（約61MB）
+# 実体はリポジトリに入れず、配布zip側で持つ。SnipOCR の dist/tesseract/ と同じ方針。
+# 再構成の手順は README.md の「ランタイムの再構成」を参照。
+/runtime/
+
+# Python
+__pycache__/
+*.pyc
+
+# 配布アーカイブ
+*.zip
+
+# 作業ファイル
+*.tmp
+*.log
+*.bak
+
+# 動作確認に使ったPDF（実業務のファイルを誤って含めないため）
+*.pdf
+
+# OS/エディタ
+Thumbs.db
+desktop.ini
