@@ -254,7 +254,9 @@ def optimize_pdf(
 
         if progress:
             progress("PDFを保存中", len(images), len(images))
-        writer.compress_identical_objects(remove_identicals=True, remove_orphans=True)
+        # ponytail: skip global object deduplication; it re-decompresses huge streams,
+        # and the drawing images are already replaced above. Re-enable only if output
+        # size becomes a measured problem and large-stream handling is added.
         with temporary.open("wb") as stream:
             writer.write(stream)
         writer.close()
