@@ -7,12 +7,13 @@ from pathlib import Path
 from typing import Callable
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-from pypdf import PdfWriter
+from pypdf import PdfWriter, filters as pypdf_filters
 from pypdf.errors import LimitReachedError, PdfReadError
 from pypdf.generic import NameObject
 
 
 ProgressCallback = Callable[[str, int, int], None]
+_LARGE_STREAM_LIMIT = 120_000_000
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,8 @@ class OptimizeOptions:
     threshold_offset: int = 0
     include_small_images: bool = False
     strip_metadata: bool = True
-    min_long_side: int = 1200
+    # Backgrounds exported as horizontal strips can be narrower than 1200px.
+    min_long_side: int = 512
     min_pixels: int = 1_000_000
 
 
@@ -122,8 +124,9 @@ def _collect_images(writer: PdfWriter, result: OptimizeResult) -> list[object]:
         try:
             keys = list(page.images.keys())
         except Exception as exc:
-            result.warnings.append(f"{page_number}ページ: 画像一覧を取得できません ({exc})")
-            continue
+            raise RuntimeError(
+                f"{page_number}ページの画像一覧を取得できないため、処理を中止しました: {exc}"
+            ) from exc
         for key in keys:
             try:
                 image_file = page.images[key]
@@ -136,10 +139,10 @@ def _collect_images(writer: PdfWriter, result: OptimizeResult) -> list[object]:
                 seen.add(object_key)
                 images.append(image_file)
             except Exception as exc:
-                result.skipped_unsupported += 1
-                result.warnings.append(
-                    f"{page_number}ページの画像 {key}: 読み込みをスキップ ({exc})"
-                )
+                raise RuntimeError(
+                    f"{page_number}ページの画像 {key} を読み込めないため、"
+                    f"混在を防ぐため処理を中止しました: {exc}"
+                ) from exc
     return images
 
 
@@ -212,7 +215,16 @@ def optimize_pdf(
         if options.strip_metadata:
             result.metadata_stripped = _strip_pdf_metadata(writer)
 
-        images = _collect_images(writer, result)
+        # ponytail: trusted local drawing PDFs may contain ~79MB RGB streams;
+        # keep a finite 120MB ceiling instead of disabling decompression limits.
+        previous_stream_limit = pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH
+        pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = max(
+            previous_stream_limit, _LARGE_STREAM_LIMIT
+        )
+        try:
+            images = _collect_images(writer, result)
+        finally:
+            pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = previous_stream_limit
         result.total_images = len(images) + result.skipped_inline
         conversion_errors: list[str] = []
 
