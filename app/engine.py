@@ -8,7 +8,7 @@ from typing import Callable
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from pypdf import PdfWriter
-from pypdf.errors import PdfReadError
+from pypdf.errors import LimitReachedError, PdfReadError
 from pypdf.generic import NameObject
 
 
@@ -214,6 +214,7 @@ def optimize_pdf(
 
         images = _collect_images(writer, result)
         result.total_images = len(images) + result.skipped_inline
+        conversion_errors: list[str] = []
 
         for index, image_file in enumerate(images, start=1):
             if cancel_event is not None and cancel_event.is_set():
@@ -244,16 +245,37 @@ def optimize_pdf(
 
                 binary, _ = _prepare_image(image, options)
                 image_file.replace(binary)
+                if image_file.image is None or image_file.image.mode != "1":
+                    raise ValueError("2値画像への差し替え結果を検証できません")
+                if image_file.image.size != binary.size:
+                    raise ValueError(
+                        f"差し替え後の寸法が不一致です ({image_file.image.size} != {binary.size})"
+                    )
                 result.converted_images += 1
-            except (OSError, ValueError, TypeError, MemoryError, PdfReadError) as exc:
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                MemoryError,
+                LimitReachedError,
+                PdfReadError,
+            ) as exc:
                 result.skipped_unsupported += 1
-                result.warnings.append(
+                message = (
                     f"画像 {index} ({getattr(image_file, 'name', '?')}): "
                     f"{type(exc).__name__} - {exc}"
                 )
+                result.warnings.append(message)
+                conversion_errors.append(message)
 
         if progress:
             progress("PDFを保存中", len(images), len(images))
+        if conversion_errors:
+            raise RuntimeError(
+                "画像変換に失敗したため、混在したPDFを保存せず中止しました。\n"
+                + "\n".join(conversion_errors[:10])
+                + (f"\n（ほか {len(conversion_errors) - 10}件）" if len(conversion_errors) > 10 else "")
+            )
         # ponytail: skip global object deduplication; it re-decompresses huge streams,
         # and the drawing images are already replaced above. Re-enable only if output
         # size becomes a measured problem and large-stream handling is added.
