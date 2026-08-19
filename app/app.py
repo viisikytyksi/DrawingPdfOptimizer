@@ -9,9 +9,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from engine import CancelledError, OptimizeOptions, OptimizeResult, optimize_pdf
+from version import __version__
 
 
-APP_NAME = "図面PDF 画像2値化"
+APP_NAME = f"図面PDF 画像2値化 v{__version__}"
 
 
 class OptimizerApp(tk.Tk):
@@ -31,6 +32,7 @@ class OptimizerApp(tk.Tk):
         self.sharpen_var = tk.BooleanVar(value=True)
         self.threshold_var = tk.IntVar(value=0)
         self.include_small_var = tk.BooleanVar(value=False)
+        self.advanced_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="PDFを追加してください。")
 
         self._build_ui()
@@ -103,6 +105,11 @@ class OptimizerApp(tk.Tk):
             text="小さい画像（ロゴ・印影など）も2値化する",
             variable=self.include_small_var,
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(
+            settings,
+            text="高度処理（時間がかかります）",
+            variable=self.advanced_var,
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         run_area = ttk.Frame(root)
         run_area.grid(row=4, column=0, sticky="ew", pady=(12, 0))
@@ -161,6 +168,7 @@ class OptimizerApp(tk.Tk):
             sharpen=self.sharpen_var.get(),
             threshold_offset=round(float(self.threshold_var.get())),
             include_small_images=self.include_small_var.get(),
+            advanced_processing=self.advanced_var.get(),
         )
         self._cancel.clear()
         self.start_button.configure(state="disabled")
