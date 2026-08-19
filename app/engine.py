@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import threading
+import concurrent.futures
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
@@ -153,6 +154,10 @@ def _advanced_profile(image: Image.Image) -> tuple[bool, float]:
     return black_ratio >= 0.20 or ambiguity >= 0.12, ambiguity
 
 
+def _prepare_image_task(image: Image.Image, options: OptimizeOptions) -> tuple[Image.Image, int]:
+    return _prepare_image(image, options)
+
+
 def _image_key(image_file: object) -> tuple[int, int] | None:
     reference = getattr(image_file, "indirect_reference", None)
     if reference is None:
@@ -289,13 +294,11 @@ def optimize_pdf(
                 for page_number, scores in page_scores.items()
             }
         conversion_errors: list[str] = []
+        work_items: list[tuple[int, object, Image.Image, OptimizeOptions]] = []
 
         for index, (page_number, image_file) in enumerate(images, start=1):
             if cancel_event is not None and cancel_event.is_set():
                 raise CancelledError("処理を中止しました。")
-            if progress:
-                progress(f"画像 {index}/{len(images)} を処理中", index - 1, len(images))
-
             try:
                 image = image_file.image
                 if image is None:
@@ -325,15 +328,7 @@ def optimize_pdf(
                         denoise=options.denoise or noisy_page,
                         threshold_offset=options.threshold_offset + (-10 if noisy_page else 0),
                     )
-                binary, _ = _prepare_image(image, image_options)
-                image_file.replace(binary)
-                if image_file.image is None or image_file.image.mode != "1":
-                    raise ValueError("2値画像への差し替え結果を検証できません")
-                if image_file.image.size != binary.size:
-                    raise ValueError(
-                        f"差し替え後の寸法が不一致です ({image_file.image.size} != {binary.size})"
-                    )
-                result.converted_images += 1
+                work_items.append((index, image_file, image, image_options))
             except (
                 OSError,
                 ValueError,
@@ -349,6 +344,45 @@ def optimize_pdf(
                 )
                 result.warnings.append(message)
                 conversion_errors.append(message)
+
+        # PIL processing releases the GIL in its expensive C operations. Keep
+        # pypdf writer mutation below serialized to avoid corrupting its object graph.
+        worker_count = min(2, len(work_items))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count or 1) as pool:
+            futures = [
+                pool.submit(_prepare_image_task, image, image_options)
+                for _, _, image, image_options in work_items
+            ]
+            for (index, image_file, _, _), future in zip(work_items, futures):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("処理を中止しました。")
+                if progress:
+                    progress(f"画像 {index}/{len(images)} を処理中", index - 1, len(images))
+                try:
+                    binary, _ = future.result()
+                    image_file.replace(binary)
+                    if image_file.image is None or image_file.image.mode != "1":
+                        raise ValueError("2値画像への差し替え結果を検証できません")
+                    if image_file.image.size != binary.size:
+                        raise ValueError(
+                            f"差し替え後の寸法が不一致です ({image_file.image.size} != {binary.size})"
+                        )
+                    result.converted_images += 1
+                except (
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    MemoryError,
+                    LimitReachedError,
+                    PdfReadError,
+                ) as exc:
+                    result.skipped_unsupported += 1
+                    message = (
+                        f"画像 {index} ({getattr(image_file, 'name', '?')}): "
+                        f"{type(exc).__name__} - {exc}"
+                    )
+                    result.warnings.append(message)
+                    conversion_errors.append(message)
 
         if progress:
             progress("PDFを保存中", len(images), len(images))
