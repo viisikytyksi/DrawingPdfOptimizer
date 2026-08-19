@@ -6,7 +6,6 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,14 +53,14 @@ def _output_folder(source: Path, parent: Path | None) -> Path:
 def _render_chunk(
     ghostscript: Path,
     source: Path,
-    temporary: Path,
+    output_dir: Path,
+    chunk_number: int,
     first_page: int,
     last_page: int,
     dpi: int,
     environment: dict[str, str],
 ) -> list[tuple[int, Path]]:
-    temporary.mkdir(parents=True, exist_ok=True)
-    pattern = temporary / "page-%03d.tif"
+    pattern = output_dir / f"chunk-{chunk_number}-page-%03d.tif"
     arguments = [
         str(ghostscript),
         "-q",
@@ -87,7 +86,7 @@ def _render_chunk(
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "Ghostscriptで変換できませんでした")
 
-    files = sorted(temporary.glob("page-*.tif"))
+    files = sorted(output_dir.glob(f"chunk-{chunk_number}-page-*.tif"))
     expected = last_page - first_page + 1
     if len(files) != expected:
         raise RuntimeError(f"出力ページ数が不一致です ({len(files)} / {expected})")
@@ -119,38 +118,39 @@ def rasterize_pdf(
         environment["GS_LIB"] = str(resource_dir)
 
     try:
-        with tempfile.TemporaryDirectory(dir=target) as temporary_root:
-            temporary_root_path = Path(temporary_root)
-            chunk_count = min(workers, page_count)
-            chunk_size = (page_count + chunk_count - 1) // chunk_count
-            chunks = [
-                (first, min(first + chunk_size - 1, page_count))
-                for first in range(1, page_count + 1, chunk_size)
+        # Use unique files in the output folder; Windows may reject worker dirs
+        # created below network/output folders with restrictive ACLs.
+        chunk_count = min(workers, page_count)
+        chunk_size = (page_count + chunk_count - 1) // chunk_count
+        chunks = [
+            (first, min(first + chunk_size - 1, page_count))
+            for first in range(1, page_count + 1, chunk_size)
+        ]
+        rendered: list[tuple[int, Path]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=chunk_count) as pool:
+            futures = [
+                pool.submit(
+                    _render_chunk,
+                    ghostscript,
+                    source,
+                    target,
+                    index,
+                    first,
+                    last,
+                    options.dpi,
+                    environment,
+                )
+                for index, (first, last) in enumerate(chunks, start=1)
             ]
-            rendered: list[tuple[int, Path]] = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=chunk_count) as pool:
-                futures = [
-                    pool.submit(
-                        _render_chunk,
-                        ghostscript,
-                        source,
-                        temporary_root_path / f"chunk-{index}",
-                        first,
-                        last,
-                        options.dpi,
-                        environment,
-                    )
-                    for index, (first, last) in enumerate(chunks, start=1)
-                ]
-                for future in futures:
-                    rendered.extend(future.result())
+            for future in futures:
+                rendered.extend(future.result())
 
-            for page_number, path in sorted(rendered):
-                destination = target / f"page-{page_number:03d}.tif"
-                shutil.move(str(path), destination)
-                with Image.open(destination) as image:
-                    if image.mode != "1":
-                        raise RuntimeError(f"1bit画像ではありません: {destination.name} ({image.mode})")
+        for page_number, path in sorted(rendered):
+            destination = target / f"page-{page_number:03d}.tif"
+            shutil.move(str(path), destination)
+            with Image.open(destination) as image:
+                if image.mode != "1":
+                    raise RuntimeError(f"1bit画像ではありません: {destination.name} ({image.mode})")
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
         raise
