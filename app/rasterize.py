@@ -18,6 +18,7 @@ class RasterizeOptions:
     dpi: int = 300
     workers: int = 2
     format: str = "png"
+    slides_mode: bool = True
 
 
 def _find_ghostscript(app_root: Path) -> tuple[Path, Path | None]:
@@ -60,12 +61,16 @@ def _render_chunk(
     last_page: int,
     dpi: int,
     output_format: str,
+    slides_mode: bool,
     environment: dict[str, str],
 ) -> list[tuple[int, Path]]:
-    device, extension = {
-        "png": ("pngmono", "png"),
-        "tif": ("tiffg4", "tif"),
-    }[output_format]
+    if slides_mode:
+        device, extension = "pnggray", "png"
+    else:
+        device, extension = {
+            "png": ("pngmono", "png"),
+            "tif": ("tiffg4", "tif"),
+        }[output_format]
     pattern = output_dir / f"chunk-{chunk_number}-page-%03d.{extension}"
     arguments = [
         str(ghostscript),
@@ -124,6 +129,7 @@ def rasterize_pdf(
     )
     if resource_dir is not None:
         environment["GS_LIB"] = str(resource_dir)
+    output_format = "png" if options.slides_mode else options.format
 
     try:
         # Use unique files in the output folder; Windows may reject worker dirs
@@ -147,7 +153,8 @@ def rasterize_pdf(
                     first,
                     last,
                     options.dpi,
-                    options.format,
+                    output_format,
+                    options.slides_mode,
                     environment,
                 )
                 for index, (first, last) in enumerate(chunks, start=1)
@@ -156,11 +163,21 @@ def rasterize_pdf(
                 rendered.extend(future.result())
 
         for page_number, path in sorted(rendered):
-            destination = target / f"page-{page_number:03d}.{options.format}"
+            destination = target / f"page-{page_number:03d}.{output_format}"
             shutil.move(str(path), destination)
+            if options.slides_mode:
+                with Image.open(destination) as image:
+                    height = max(1, round(image.height * 2560 / image.width))
+                    resized = image.convert("L").resize(
+                        (2560, height), Image.Resampling.LANCZOS
+                    )
+                    temporary = destination.with_name(destination.stem + ".resize.png")
+                    resized.save(temporary, format="PNG", optimize=True)
+                os.replace(temporary, destination)
             with Image.open(destination) as image:
-                if image.mode != "1":
-                    raise RuntimeError(f"1bit画像ではありません: {destination.name} ({image.mode})")
+                expected_mode = "L" if options.slides_mode else "1"
+                if image.mode != expected_mode:
+                    raise RuntimeError(f"想定モードではありません: {destination.name} ({image.mode})")
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
         raise
@@ -169,8 +186,9 @@ def rasterize_pdf(
         "input": str(source),
         "output_dir": str(target),
         "pages": page_count,
-        "format": options.format,
-            "workers": worker_count,
+        "format": output_format,
+        "slides_mode": options.slides_mode,
+        "workers": worker_count,
     }
 
 
@@ -181,8 +199,9 @@ def main() -> int:
     parser.add_argument("--dpi", type=int, choices=(200, 300, 400), default=300)
     parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--format", choices=("png", "tif"), default="png")
+    parser.add_argument("--no-slides", action="store_true", help="2560px LモードPNG化を無効にする")
     args = parser.parse_args()
-    options = RasterizeOptions(args.dpi, args.workers, args.format)
+    options = RasterizeOptions(args.dpi, args.workers, args.format, not args.no_slides)
     root = Path(__file__).resolve().parents[1]
     results = [rasterize_pdf(path, args.output_dir, options, root) for path in args.inputs]
     # Keep the pipe ASCII-only; Windows PowerShell 5.1 may decode redirected
