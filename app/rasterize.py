@@ -120,14 +120,15 @@ def rasterize_pdf(
     try:
         # Use unique files in the output folder; Windows may reject worker dirs
         # created below network/output folders with restrictive ACLs.
-        chunk_count = min(workers, page_count)
+        worker_count = min(workers, page_count)
+        chunk_count = min(worker_count if worker_count == 1 else worker_count * 2, page_count)
         chunk_size = (page_count + chunk_count - 1) // chunk_count
         chunks = [
             (first, min(first + chunk_size - 1, page_count))
             for first in range(1, page_count + 1, chunk_size)
         ]
         rendered: list[tuple[int, Path]] = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=chunk_count) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = [
                 pool.submit(
                     _render_chunk,
@@ -160,7 +161,7 @@ def rasterize_pdf(
         "output_dir": str(target),
         "pages": page_count,
         "format": "tif",
-        "workers": chunk_count,
+            "workers": worker_count,
     }
 
 
