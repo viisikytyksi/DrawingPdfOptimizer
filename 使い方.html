@@ -26,7 +26,7 @@
 </head>
 <body>
 
-<h1>図面PDF最適化　使い方 <small>Version 0.3.1</small></h1>
+<h1>図面PDF最適化　使い方 <small>Version 0.4.0</small></h1>
 <p class="lead">スキャンした図面PDFを、白黒くっきり・軽量にするツールです。インストールは不要です。</p>
 
 <div class="what">
@@ -68,18 +68,18 @@
 <p><span class="file">Rasterize.cmd</span> を使うと、ベクトル図形も含めてPDFの<strong>全ページを1bit画像として再作成</strong>できます。元PDF内のベクトル線を残したくない場合に使います。</p>
 <ol>
   <li>PDFを <span class="file">Rasterize.cmd</span> にドラッグ＆ドロップします。</li>
-  <li>設定画面で解像度と形式（既定はPNG）を選び、「画像化を開始」を押します。</li>
+  <li>設定画面で解像度と並列数を選び、「画像化を開始」を押します。</li>
   <li>元PDFと同じ場所に <code>PDF名_画像化</code> フォルダーが作成され、ページごとに画像が保存されます。</li>
 </ol>
 <ul>
-  <li>PNG … 扱いやすい標準形式</li>
-  <li>TIFF … 印刷・画像処理向け。ページごとに別ファイル</li>
+  <li>出力形式は1bit TIFF（Group 4）です。</li>
+  <li>既定2並列で処理します。低速PCでは1、高速PCでは4を選べます。</li>
 </ul>
 <div class="note">
   <strong>画像化すると、文字やベクトル線は選択・編集できなくなります。</strong>ページ全体が画像になるため、検索可能な文字情報やCAD線の性質も失われます。公開・印刷用の最終版など、用途を確認して使ってください。
 </div>
 <div class="warn">
-  全ページ画像化には<strong>ImageMagickとGhostscript</strong>が必要です。配布フォルダー内の <code>runtime\ImageMagick\magick.exe</code> と <code>runtime\Ghostscript\bin\gswin64c.exe</code> に、実行に必要な最小のDLL・設定ファイル・<code>Resource</code>フォルダーとともに配置してください。未配置の場合は「ImageMagickが見つかりません」と表示されます。
+  全ページ画像化には<strong>Ghostscript</strong>が必要です。配布フォルダー内の <code>runtime\Ghostscript\bin\gswin64c.exe</code> に、実行に必要なDLLと<code>Resource</code>フォルダーを含めて配置してください。未配置の場合は「Ghostscriptが見つかりません」と表示されます。
 </div>
 <p>配布フォルダーをNAS上に置いて使う場合も、<span class="file">Rasterize.cmd</span>を直接起動してください。UNCパス（<code>\\サーバー\共有</code>）に対応しています。</p>
 

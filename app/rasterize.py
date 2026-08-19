@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,30 +17,27 @@ from pypdf import PdfReader
 @dataclass(frozen=True)
 class RasterizeOptions:
     dpi: int = 300
-    output_format: str = "png"
-    threshold: int = 50
+    workers: int = 2
 
 
-def _find_magick(app_root: Path) -> tuple[Path, Path | None]:
+def _find_ghostscript(app_root: Path) -> tuple[Path, Path | None]:
     runtime_root = app_root / "runtime"
-    image_dir = runtime_root / "ImageMagick"
-    candidates = [image_dir / "magick.exe", image_dir / "convert.exe"]
-    magick = next((path for path in candidates if path.is_file()), None)
-    if magick is None:
-        # Do not use PATH's `convert.exe`: Windows ships a different disk utility
-        # with that name. Legacy ImageMagick convert.exe is supported only when
-        # explicitly placed under runtime/ImageMagick.
-        command = shutil.which("magick")
-        magick = Path(command) if command else None
-    if magick is None:
+    ghostscript_root = runtime_root / "Ghostscript"
+    candidates = [
+        ghostscript_root / "bin" / "gswin64c.exe",
+        ghostscript_root / "bin" / "gswin32c.exe",
+    ]
+    ghostscript = next((path for path in candidates if path.is_file()), None)
+    if ghostscript is None:
+        command = shutil.which("gswin64c") or shutil.which("gswin32c")
+        ghostscript = Path(command) if command else None
+    if ghostscript is None:
         raise FileNotFoundError(
-            "ImageMagickが見つかりません。runtime\\ImageMagick\\magick.exeへ配置してください。"
+            "Ghostscriptが見つかりません。"
+            "runtime\\Ghostscript\\bin\\gswin64c.exeへ配置してください。"
         )
-
-    ghostscript_dir = runtime_root / "Ghostscript" / "bin"
-    if not ghostscript_dir.is_dir():
-        ghostscript_dir = None
-    return magick, ghostscript_dir
+    resource_dir = ghostscript.parent.parent / "Resource"
+    return ghostscript, resource_dir if resource_dir.is_dir() else None
 
 
 def _output_folder(source: Path, parent: Path | None) -> Path:
@@ -52,6 +51,49 @@ def _output_folder(source: Path, parent: Path | None) -> Path:
     return candidate
 
 
+def _render_chunk(
+    ghostscript: Path,
+    source: Path,
+    temporary: Path,
+    first_page: int,
+    last_page: int,
+    dpi: int,
+    environment: dict[str, str],
+) -> list[tuple[int, Path]]:
+    temporary.mkdir(parents=True, exist_ok=True)
+    pattern = temporary / "page-%03d.tif"
+    arguments = [
+        str(ghostscript),
+        "-q",
+        "-dSAFER",
+        "-dBATCH",
+        "-dNOPAUSE",
+        "-sDEVICE=tiffg4",
+        f"-r{dpi}",
+        f"-dFirstPage={first_page}",
+        f"-dLastPage={last_page}",
+        f"-sOutputFile={pattern}",
+        str(source),
+    ]
+    completed = subprocess.run(
+        arguments,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(completed.stderr.strip() or "Ghostscriptで変換できませんでした")
+
+    files = sorted(temporary.glob("page-*.tif"))
+    expected = last_page - first_page + 1
+    if len(files) != expected:
+        raise RuntimeError(f"出力ページ数が不一致です ({len(files)} / {expected})")
+    return [(first_page + index, path) for index, path in enumerate(files)]
+
+
 def rasterize_pdf(
     input_path: str | os.PathLike[str],
     output_parent: str | os.PathLike[str] | None,
@@ -61,69 +103,54 @@ def rasterize_pdf(
     source = Path(input_path)
     if source.suffix.lower() != ".pdf":
         raise ValueError(f"PDFではありません: {source}")
-    if options.output_format not in {"png", "tif"}:
-        raise ValueError("出力形式はpngまたはtifです")
+    if options.dpi not in {200, 300, 400}:
+        raise ValueError("解像度は200、300、400のいずれかです")
+    workers = max(1, min(4, int(options.workers)))
 
     page_count = len(PdfReader(str(source), strict=False).pages)
     root = app_root or Path(__file__).resolve().parents[1]
-    magick, ghostscript_dir = _find_magick(root)
+    ghostscript, resource_dir = _find_ghostscript(root)
     target = _output_folder(source, Path(output_parent) if output_parent else None)
-    extension = options.output_format
-    pattern = target / f"page-%03d.{extension}"
-    arguments = [
-        str(magick),
-        "-quiet",
-        "-density",
-        str(options.dpi),
-        "-scene",
-        "1",
-        str(source),
-        "-background",
-        "white",
-        "-alpha",
-        "remove",
-        "-alpha",
-        "off",
-        "-colorspace",
-        "Gray",
-        "-threshold",
-        f"{options.threshold}%",
-        "-type",
-        "Bilevel",
-    ]
-    if extension == "tif":
-        arguments.extend(["-compress", "Group4"])
-    arguments.extend(["-strip", str(pattern)])
-
     environment = os.environ.copy()
     environment["PATH"] = os.pathsep.join(
-        str(path) for path in (magick.parent, ghostscript_dir, environment.get("PATH", "")) if path
+        str(path) for path in (ghostscript.parent, environment.get("PATH", "")) if path
     )
-    environment["MAGICK_HOME"] = str(magick.parent)
-    if ghostscript_dir is not None:
-        resource_dir = ghostscript_dir.parent / "Resource"
-        if resource_dir.is_dir():
-            environment["GS_LIB"] = str(resource_dir)
-    try:
-        completed = subprocess.run(
-            arguments,
-            env=environment,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError(completed.stderr.strip() or "ImageMagickで変換できませんでした")
+    if resource_dir is not None:
+        environment["GS_LIB"] = str(resource_dir)
 
-        files = sorted(target.glob(f"page-*.{extension}"))
-        if len(files) != page_count:
-            raise RuntimeError(f"出力ページ数が不一致です ({len(files)} / {page_count})")
-        for path in files:
-            with Image.open(path) as image:
-                if image.mode != "1":
-                    raise RuntimeError(f"1bit画像ではありません: {path.name} ({image.mode})")
+    try:
+        with tempfile.TemporaryDirectory(dir=target) as temporary_root:
+            temporary_root_path = Path(temporary_root)
+            chunk_count = min(workers, page_count)
+            chunk_size = (page_count + chunk_count - 1) // chunk_count
+            chunks = [
+                (first, min(first + chunk_size - 1, page_count))
+                for first in range(1, page_count + 1, chunk_size)
+            ]
+            rendered: list[tuple[int, Path]] = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=chunk_count) as pool:
+                futures = [
+                    pool.submit(
+                        _render_chunk,
+                        ghostscript,
+                        source,
+                        temporary_root_path / f"chunk-{index}",
+                        first,
+                        last,
+                        options.dpi,
+                        environment,
+                    )
+                    for index, (first, last) in enumerate(chunks, start=1)
+                ]
+                for future in futures:
+                    rendered.extend(future.result())
+
+            for page_number, path in sorted(rendered):
+                destination = target / f"page-{page_number:03d}.tif"
+                shutil.move(str(path), destination)
+                with Image.open(destination) as image:
+                    if image.mode != "1":
+                        raise RuntimeError(f"1bit画像ではありません: {destination.name} ({image.mode})")
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
         raise
@@ -132,7 +159,8 @@ def rasterize_pdf(
         "input": str(source),
         "output_dir": str(target),
         "pages": page_count,
-        "format": extension,
+        "format": "tif",
+        "workers": chunk_count,
     }
 
 
@@ -141,10 +169,9 @@ def main() -> int:
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dpi", type=int, choices=(200, 300, 400), default=300)
-    parser.add_argument("--format", choices=("png", "tif"), default="png")
-    parser.add_argument("--threshold", type=int, choices=range(1, 100), default=50)
+    parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=2)
     args = parser.parse_args()
-    options = RasterizeOptions(args.dpi, args.format, args.threshold)
+    options = RasterizeOptions(args.dpi, args.workers)
     root = Path(__file__).resolve().parents[1]
     results = [rasterize_pdf(path, args.output_dir, options, root) for path in args.inputs]
     print(json.dumps({"results": results}, ensure_ascii=False))

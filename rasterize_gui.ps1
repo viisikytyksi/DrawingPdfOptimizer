@@ -83,31 +83,18 @@ $dpiCombo.DropDownStyle = "DropDownList"
 [void]$dpiCombo.Items.AddRange(@("200", "300", "400"))
 $dpiCombo.SelectedItem = "300"
 $settings.Controls.Add($dpiCombo)
-$formatLabel = New-Object System.Windows.Forms.Label
-$formatLabel.Text = "形式"
-$formatLabel.Location = New-Object System.Drawing.Point(205, 28)
-$formatLabel.AutoSize = $true
-$settings.Controls.Add($formatLabel)
-$formatCombo = New-Object System.Windows.Forms.ComboBox
-$formatCombo.Location = New-Object System.Drawing.Point(250, 24)
-$formatCombo.Size = New-Object System.Drawing.Size(90, 25)
-$formatCombo.DropDownStyle = "DropDownList"
-[void]$formatCombo.Items.AddRange(@("PNG", "TIFF"))
-$formatCombo.SelectedItem = "PNG"
-$settings.Controls.Add($formatCombo)
-$thresholdLabel = New-Object System.Windows.Forms.Label
-$thresholdLabel.Text = "しきい値"
-$thresholdLabel.Location = New-Object System.Drawing.Point(390, 28)
-$thresholdLabel.AutoSize = $true
-$settings.Controls.Add($thresholdLabel)
-$thresholdTrack = New-Object System.Windows.Forms.TrackBar
-$thresholdTrack.Location = New-Object System.Drawing.Point(460, 16)
-$thresholdTrack.Size = New-Object System.Drawing.Size(220, 45)
-$thresholdTrack.Minimum = 1
-$thresholdTrack.Maximum = 99
-$thresholdTrack.Value = 50
-$thresholdTrack.TickFrequency = 10
-$settings.Controls.Add($thresholdTrack)
+$workersLabel = New-Object System.Windows.Forms.Label
+$workersLabel.Text = "並列数"
+$workersLabel.Location = New-Object System.Drawing.Point(250, 28)
+$workersLabel.AutoSize = $true
+$settings.Controls.Add($workersLabel)
+$workersCombo = New-Object System.Windows.Forms.ComboBox
+$workersCombo.Location = New-Object System.Drawing.Point(320, 24)
+$workersCombo.Size = New-Object System.Drawing.Size(80, 25)
+$workersCombo.DropDownStyle = "DropDownList"
+[void]$workersCombo.Items.AddRange(@("1", "2", "4"))
+$workersCombo.SelectedItem = "2"
+$settings.Controls.Add($workersCombo)
 
 $progress = New-Object System.Windows.Forms.ProgressBar
 $progress.Location = New-Object System.Drawing.Point(12, 430)
@@ -188,8 +175,7 @@ $startButton.Add_Click({
     if ($outputText.Text -and -not (Test-Path -LiteralPath $outputText.Text -PathType Container)) {
         [System.Windows.Forms.MessageBox]::Show("保存先フォルダーが見つかりません。", "図面PDF 全ページ画像化", "OK", "Error"); return
     }
-    $format = if ($formatCombo.SelectedItem -eq "TIFF") { "tif" } else { "png" }
-    $arguments = @((Quote-Argument $scriptPath), "--dpi", $dpiCombo.SelectedItem, "--format", $format, "--threshold", $thresholdTrack.Value)
+    $arguments = @((Quote-Argument $scriptPath), "--dpi", $dpiCombo.SelectedItem, "--workers", $workersCombo.SelectedItem)
     if ($outputText.Text) { $arguments += @("--output-dir", (Quote-Argument $outputText.Text)) }
     foreach ($file in $fileList.Items) { $arguments += Quote-Argument ([string]$file) }
     $info = New-Object System.Diagnostics.ProcessStartInfo

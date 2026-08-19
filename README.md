@@ -1,6 +1,6 @@
 # 図面PDF 画像2値化
 
-Version 0.3.1
+Version 0.4.0
 
 CADのベクトル線・文字を保持したまま、PDF内の大きなラスター画像だけを明瞭化・A3向け解像度に縮小・1bit化するWindowsアプリです。
 
@@ -80,15 +80,16 @@ python .\build_portable.py <出力フォルダー>
 
 ベクトル図形も含めてPDFの各ページを完全にラスタライズし、ページごとの1bit画像として保存する場合は `Rasterize.cmd` を起動します。
 
-- 既定: 300dpi・PNG
-- PNG/TIFFを選択可能（どちらも1ページ1ファイル）
+- 既定: 300dpi・1bit TIFF（Group 4）
+- Ghostscriptでページごとの1bit TIFF（Group 4）を直接生成
+- 既定2並列。設定画面またはCLIで1/2/4並列を選択可能
 - 入力PDFごとに `<PDF名>_画像化` フォルダーを作成
-- ImageMagickとGhostscriptを `runtime\ImageMagick\`、`runtime\Ghostscript\bin\` に配置
+- Ghostscriptを `runtime\Ghostscript\bin\` に配置
 - `runtime/` は `.gitignore` 対象で、Pythonと依存バイナリはGitへ登録しない
-- ImageMagickは実行ファイルだけでなく同梱DLL・設定ファイル、Ghostscriptは`Resource`等の実行に必要な最小フォルダーも配置する
+- Ghostscriptは実行ファイルだけでなく`Resource`等の実行に必要な最小フォルダーも配置する
 - NAS上で使う場合も `Rasterize.cmd` を直接起動できます。内部でUNCパスを一時ドライブへ割り当てて処理します。
 
-ImageMagickのPDF読み込みにはGhostscriptが必要です。PDFのセキュリティポリシーで読み込みが拒否される場合は、同梱版の設定を確認してください。
+GhostscriptのPDF読み込みには実行に必要なDLLと`Resource`フォルダーが必要です。
 
 ## License
 
