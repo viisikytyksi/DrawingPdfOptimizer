@@ -17,6 +17,7 @@ from pypdf import PdfReader
 class RasterizeOptions:
     dpi: int = 300
     workers: int = 2
+    format: str = "png"
 
 
 def _find_ghostscript(app_root: Path) -> tuple[Path, Path | None]:
@@ -58,16 +59,21 @@ def _render_chunk(
     first_page: int,
     last_page: int,
     dpi: int,
+    output_format: str,
     environment: dict[str, str],
 ) -> list[tuple[int, Path]]:
-    pattern = output_dir / f"chunk-{chunk_number}-page-%03d.tif"
+    device, extension = {
+        "png": ("pngmono", "png"),
+        "tif": ("tiffg4", "tif"),
+    }[output_format]
+    pattern = output_dir / f"chunk-{chunk_number}-page-%03d.{extension}"
     arguments = [
         str(ghostscript),
         "-q",
         "-dSAFER",
         "-dBATCH",
         "-dNOPAUSE",
-        "-sDEVICE=tiffg4",
+        f"-sDEVICE={device}",
         f"-r{dpi}",
         f"-dFirstPage={first_page}",
         f"-dLastPage={last_page}",
@@ -86,7 +92,7 @@ def _render_chunk(
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or "Ghostscriptで変換できませんでした")
 
-    files = sorted(output_dir.glob(f"chunk-{chunk_number}-page-*.tif"))
+    files = sorted(output_dir.glob(f"chunk-{chunk_number}-page-*.{extension}"))
     expected = last_page - first_page + 1
     if len(files) != expected:
         raise RuntimeError(f"出力ページ数が不一致です ({len(files)} / {expected})")
@@ -104,6 +110,8 @@ def rasterize_pdf(
         raise ValueError(f"PDFではありません: {source}")
     if options.dpi not in {200, 300, 400}:
         raise ValueError("解像度は200、300、400のいずれかです")
+    if options.format not in {"png", "tif"}:
+        raise ValueError("形式はpngまたはtifです")
     workers = max(1, min(4, int(options.workers)))
 
     page_count = len(PdfReader(str(source), strict=False).pages)
@@ -139,6 +147,7 @@ def rasterize_pdf(
                     first,
                     last,
                     options.dpi,
+                    options.format,
                     environment,
                 )
                 for index, (first, last) in enumerate(chunks, start=1)
@@ -147,7 +156,7 @@ def rasterize_pdf(
                 rendered.extend(future.result())
 
         for page_number, path in sorted(rendered):
-            destination = target / f"page-{page_number:03d}.tif"
+            destination = target / f"page-{page_number:03d}.{options.format}"
             shutil.move(str(path), destination)
             with Image.open(destination) as image:
                 if image.mode != "1":
@@ -160,7 +169,7 @@ def rasterize_pdf(
         "input": str(source),
         "output_dir": str(target),
         "pages": page_count,
-        "format": "tif",
+        "format": options.format,
             "workers": worker_count,
     }
 
@@ -171,11 +180,14 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dpi", type=int, choices=(200, 300, 400), default=300)
     parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=2)
+    parser.add_argument("--format", choices=("png", "tif"), default="png")
     args = parser.parse_args()
-    options = RasterizeOptions(args.dpi, args.workers)
+    options = RasterizeOptions(args.dpi, args.workers, args.format)
     root = Path(__file__).resolve().parents[1]
     results = [rasterize_pdf(path, args.output_dir, options, root) for path in args.inputs]
-    print(json.dumps({"results": results}, ensure_ascii=False))
+    # Keep the pipe ASCII-only; Windows PowerShell 5.1 may decode redirected
+    # stdout with a different code page even when the GUI requests UTF-8.
+    print(json.dumps({"results": results}, ensure_ascii=True))
     return 0
 
 

@@ -26,7 +26,7 @@
 </head>
 <body>
 
-<h1>図面PDF最適化　使い方 <small>Version 0.5.0</small></h1>
+<h1>図面PDF最適化　使い方 <small>Version 0.6.0</small></h1>
 <p class="lead">スキャンした図面PDFを、白黒くっきり・軽量にするツールです。インストールは不要です。</p>
 
 <div class="what">
@@ -68,11 +68,11 @@
 <p><span class="file">Rasterize.cmd</span> を使うと、ベクトル図形も含めてPDFの<strong>全ページを1bit画像として再作成</strong>できます。元PDF内のベクトル線を残したくない場合に使います。</p>
 <ol>
   <li>PDFを <span class="file">Rasterize.cmd</span> にドラッグ＆ドロップします。</li>
-  <li>設定画面で解像度と並列数を選び、「画像化を開始」を押します。</li>
+  <li>設定画面で解像度・並列数・出力形式を選び、「画像化を開始」を押します。</li>
   <li>元PDFと同じ場所に <code>PDF名_画像化</code> フォルダーが作成され、ページごとに画像が保存されます。</li>
 </ol>
 <ul>
-  <li>出力形式は1bit TIFF（Group 4）です。</li>
+  <li>既定の出力形式はGoogle Slidesで扱いやすい1bit PNGです。TIFF（Group 4）も選択できます。</li>
   <li>既定2並列で処理します。低速PCでは1、高速PCでは4を選べます。</li>
 </ul>
 <div class="note">

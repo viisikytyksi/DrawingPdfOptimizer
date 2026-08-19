@@ -95,6 +95,18 @@ $workersCombo.DropDownStyle = "DropDownList"
 [void]$workersCombo.Items.AddRange(@("1", "2", "4"))
 $workersCombo.SelectedItem = "2"
 $settings.Controls.Add($workersCombo)
+$formatLabel = New-Object System.Windows.Forms.Label
+$formatLabel.Text = "形式"
+$formatLabel.Location = New-Object System.Drawing.Point(440, 28)
+$formatLabel.AutoSize = $true
+$settings.Controls.Add($formatLabel)
+$formatCombo = New-Object System.Windows.Forms.ComboBox
+$formatCombo.Location = New-Object System.Drawing.Point(490, 24)
+$formatCombo.Size = New-Object System.Drawing.Size(90, 25)
+$formatCombo.DropDownStyle = "DropDownList"
+[void]$formatCombo.Items.AddRange(@("PNG", "TIFF"))
+$formatCombo.SelectedItem = "PNG"
+$settings.Controls.Add($formatCombo)
 
 $progress = New-Object System.Windows.Forms.ProgressBar
 $progress.Location = New-Object System.Drawing.Point(12, 430)
@@ -175,7 +187,8 @@ $startButton.Add_Click({
     if ($outputText.Text -and -not (Test-Path -LiteralPath $outputText.Text -PathType Container)) {
         [System.Windows.Forms.MessageBox]::Show("保存先フォルダーが見つかりません。", "図面PDF 全ページ画像化", "OK", "Error"); return
     }
-    $arguments = @((Quote-Argument $scriptPath), "--dpi", $dpiCombo.SelectedItem, "--workers", $workersCombo.SelectedItem)
+    $format = if ($formatCombo.SelectedItem -eq "TIFF") { "tif" } else { "png" }
+    $arguments = @((Quote-Argument $scriptPath), "--dpi", $dpiCombo.SelectedItem, "--workers", $workersCombo.SelectedItem, "--format", $format)
     if ($outputText.Text) { $arguments += @("--output-dir", (Quote-Argument $outputText.Text)) }
     foreach ($file in $fileList.Items) { $arguments += Quote-Argument ([string]$file) }
     $info = New-Object System.Diagnostics.ProcessStartInfo
