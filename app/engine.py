@@ -261,18 +261,20 @@ def optimize_pdf(
         # ponytail: trusted local drawing PDFs may contain ~79MB RGB streams;
         # keep a finite 120MB ceiling instead of disabling decompression limits.
         previous_stream_limit = pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH
-        previous_flate_limit = pypdf_filters.FLATE_MAX_BUFFER_SIZE
+        previous_flate_limit = getattr(pypdf_filters, "FLATE_MAX_BUFFER_SIZE", None)
         pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = max(
             previous_stream_limit, _LARGE_STREAM_LIMIT
         )
-        pypdf_filters.FLATE_MAX_BUFFER_SIZE = max(
-            previous_flate_limit, _LARGE_STREAM_LIMIT
-        )
+        if previous_flate_limit is not None:
+            pypdf_filters.FLATE_MAX_BUFFER_SIZE = max(
+                previous_flate_limit, _LARGE_STREAM_LIMIT
+            )
         try:
             images = _collect_images(writer, result)
         finally:
             pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = previous_stream_limit
-            pypdf_filters.FLATE_MAX_BUFFER_SIZE = previous_flate_limit
+            if previous_flate_limit is not None:
+                pypdf_filters.FLATE_MAX_BUFFER_SIZE = previous_flate_limit
         result.total_images = len(images) + result.skipped_inline
         page_profiles: dict[int, bool] = {}
         if options.advanced_processing:
