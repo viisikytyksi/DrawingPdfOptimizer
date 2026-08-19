@@ -18,7 +18,7 @@ class RasterizeOptions:
     dpi: int = 300
     workers: int = 2
     format: str = "png"
-    slides_mode: bool = True
+    slides_mode: bool = False
 
 
 def _find_ghostscript(app_root: Path) -> tuple[Path, Path | None]:
@@ -199,9 +199,11 @@ def main() -> int:
     parser.add_argument("--dpi", type=int, choices=(200, 300, 400), default=300)
     parser.add_argument("--workers", type=int, choices=(1, 2, 4), default=2)
     parser.add_argument("--format", choices=("png", "tif"), default="png")
-    parser.add_argument("--no-slides", action="store_true", help="2560px LモードPNG化を無効にする")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--slides", action="store_true", help="2560px LモードPNG化を有効にする")
+    mode.add_argument("--no-slides", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    options = RasterizeOptions(args.dpi, args.workers, args.format, not args.no_slides)
+    options = RasterizeOptions(args.dpi, args.workers, args.format, args.slides)
     root = Path(__file__).resolve().parents[1]
     results = [rasterize_pdf(path, args.output_dir, options, root) for path in args.inputs]
     # Keep the pipe ASCII-only; Windows PowerShell 5.1 may decode redirected

@@ -108,10 +108,10 @@ $formatCombo.DropDownStyle = "DropDownList"
 $formatCombo.SelectedItem = "PNG"
 $settings.Controls.Add($formatCombo)
 $slidesCheck = New-Object System.Windows.Forms.CheckBox
-$slidesCheck.Text = "Slides向け2560px L PNG"
+$slidesCheck.Text = "2560px L PNG"
 $slidesCheck.Location = New-Object System.Drawing.Point(590, 25)
 $slidesCheck.Size = New-Object System.Drawing.Size(175, 25)
-$slidesCheck.Checked = $true
+$slidesCheck.Checked = $false
 $settings.Controls.Add($slidesCheck)
 $slidesCheck.Add_CheckedChanged({
     $formatCombo.Enabled = -not $slidesCheck.Checked
@@ -199,7 +199,7 @@ $startButton.Add_Click({
     }
     $format = if ($formatCombo.SelectedItem -eq "TIFF") { "tif" } else { "png" }
     $arguments = @((Quote-Argument $scriptPath), "--dpi", $dpiCombo.SelectedItem, "--workers", $workersCombo.SelectedItem, "--format", $format)
-    if (-not $slidesCheck.Checked) { $arguments += "--no-slides" }
+    if ($slidesCheck.Checked) { $arguments += "--slides" }
     if ($outputText.Text) { $arguments += @("--output-dir", (Quote-Argument $outputText.Text)) }
     foreach ($file in $fileList.Items) { $arguments += Quote-Argument ([string]$file) }
     $info = New-Object System.Diagnostics.ProcessStartInfo
