@@ -2,17 +2,19 @@ from __future__ import annotations
 
 import os
 import threading
-from dataclasses import dataclass, field
+import concurrent.futures
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
-from pypdf import PdfWriter
-from pypdf.errors import PdfReadError
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
+from pypdf import PdfWriter, filters as pypdf_filters
+from pypdf.errors import LimitReachedError, PdfReadError
 from pypdf.generic import NameObject
 
 
 ProgressCallback = Callable[[str, int, int], None]
+_LARGE_STREAM_LIMIT = 120_000_000
 
 
 @dataclass(frozen=True)
@@ -21,10 +23,13 @@ class OptimizeOptions:
     auto_contrast: bool = True
     contrast: float = 1.15
     sharpen: bool = True
+    denoise: bool = False
+    advanced_processing: bool = False
     threshold_offset: int = 0
     include_small_images: bool = False
     strip_metadata: bool = True
-    min_long_side: int = 1200
+    # Backgrounds exported as horizontal strips can be narrower than 1200px.
+    min_long_side: int = 512
     min_pixels: int = 1_000_000
 
 
@@ -91,13 +96,32 @@ def _prepare_image(image: Image.Image, options: OptimizeOptions) -> tuple[Image.
         white.alpha_composite(rgba)
         image = white.convert("RGB")
 
-    gray = image.convert("L")
-    max_size = _a3_pixel_box(gray, options.dpi)
-    if gray.width > max_size[0] or gray.height > max_size[1]:
-        gray.thumbnail(max_size, Image.Resampling.LANCZOS)
+    # Cyan/blue blueprint backgrounds become dark in luminance. The red
+    # channel keeps white paper/lines bright while suppressing the blue dye;
+    # for grayscale input it is identical to luminance.
+    working = image.convert("RGB")
+    max_size = _a3_pixel_box(working, options.dpi)
+    if working.width > max_size[0] or working.height > max_size[1]:
+        working.thumbnail(max_size, Image.Resampling.LANCZOS)
+    gray = working.getchannel("R")
+
+    # Remove slow paper/stain illumination changes before thresholding.
+    # ponytail: fixed-radius local normalization; upgrade to adaptive windows
+    # only if mixed-scale drawings still show measurable background loss.
+    background = gray.filter(ImageFilter.GaussianBlur(radius=25))
+    gray = ImageChops.subtract(gray, background, offset=128)
+    if options.advanced_processing:
+        red = working.getchannel("R")
+        blue = working.getchannel("B")
+        blue_score = ImageChops.subtract(blue, red, offset=128)
+        blue_mask = blue_score.point(lambda value: 255 if value >= 145 else 0)
+        blue_mask = blue_mask.filter(ImageFilter.MedianFilter(size=3))
+        gray = ImageChops.subtract(gray, blue_mask.point(lambda value: 10 if value else 0))
 
     if options.auto_contrast:
         gray = ImageOps.autocontrast(gray, cutoff=0.5)
+    if options.denoise:
+        gray = gray.filter(ImageFilter.MedianFilter(size=3))
     if options.contrast != 1.0:
         gray = ImageEnhance.Contrast(gray).enhance(options.contrast)
     if options.sharpen:
@@ -105,7 +129,33 @@ def _prepare_image(image: Image.Image, options: OptimizeOptions) -> tuple[Image.
 
     threshold = max(0, min(255, _otsu_threshold(gray) + options.threshold_offset))
     table = [0 if value <= threshold else 255 for value in range(256)]
-    return gray.point(table, mode="1"), threshold
+    binary = gray.point(table, mode="1")
+    # ponytail: line drawings should have a white majority; invert blueprints
+    # whose blue paper was classified as the dark background by Otsu.
+    histogram = binary.histogram()
+    if histogram[0] > histogram[255]:
+        binary = ImageOps.invert(binary.convert("L")).convert("1")
+    return binary, threshold
+
+
+def _advanced_profile(image: Image.Image) -> tuple[bool, float]:
+    """Return (needs_denoise, ambiguity_score) from a small preview."""
+    image.load()
+    preview = image.convert("RGB").getchannel("R")
+    preview.thumbnail((512, 512), Image.Resampling.BILINEAR)
+    background = preview.filter(ImageFilter.GaussianBlur(radius=5))
+    preview = ImageChops.subtract(preview, background, offset=128)
+    preview = ImageOps.autocontrast(preview, cutoff=0.5)
+    threshold = _otsu_threshold(preview)
+    histogram = preview.histogram()
+    total = preview.width * preview.height
+    black_ratio = sum(histogram[: threshold + 1]) / max(total, 1)
+    ambiguity = sum(histogram[max(0, threshold - 10) : min(256, threshold + 11)]) / max(total, 1)
+    return black_ratio >= 0.20 or ambiguity >= 0.12, ambiguity
+
+
+def _prepare_image_task(image: Image.Image, options: OptimizeOptions) -> tuple[Image.Image, int]:
+    return _prepare_image(image, options)
 
 
 def _image_key(image_file: object) -> tuple[int, int] | None:
@@ -115,15 +165,16 @@ def _image_key(image_file: object) -> tuple[int, int] | None:
     return int(reference.idnum), int(reference.generation)
 
 
-def _collect_images(writer: PdfWriter, result: OptimizeResult) -> list[object]:
-    images: list[object] = []
+def _collect_images(writer: PdfWriter, result: OptimizeResult) -> list[tuple[int, object]]:
+    images: list[tuple[int, object]] = []
     seen: set[tuple[int, int]] = set()
     for page_number, page in enumerate(writer.pages, start=1):
         try:
             keys = list(page.images.keys())
         except Exception as exc:
-            result.warnings.append(f"{page_number}ページ: 画像一覧を取得できません ({exc})")
-            continue
+            raise RuntimeError(
+                f"{page_number}ページの画像一覧を取得できないため、処理を中止しました: {exc}"
+            ) from exc
         for key in keys:
             try:
                 image_file = page.images[key]
@@ -134,12 +185,12 @@ def _collect_images(writer: PdfWriter, result: OptimizeResult) -> list[object]:
                 if object_key in seen:
                     continue
                 seen.add(object_key)
-                images.append(image_file)
+                images.append((page_number, image_file))
             except Exception as exc:
-                result.skipped_unsupported += 1
-                result.warnings.append(
-                    f"{page_number}ページの画像 {key}: 読み込みをスキップ ({exc})"
-                )
+                raise RuntimeError(
+                    f"{page_number}ページの画像 {key} を読み込めないため、"
+                    f"混在を防ぐため処理を中止しました: {exc}"
+                ) from exc
     return images
 
 
@@ -212,15 +263,42 @@ def optimize_pdf(
         if options.strip_metadata:
             result.metadata_stripped = _strip_pdf_metadata(writer)
 
-        images = _collect_images(writer, result)
+        # ponytail: trusted local drawing PDFs may contain ~79MB RGB streams;
+        # keep a finite 120MB ceiling instead of disabling decompression limits.
+        previous_stream_limit = pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH
+        previous_flate_limit = getattr(pypdf_filters, "FLATE_MAX_BUFFER_SIZE", None)
+        pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = max(
+            previous_stream_limit, _LARGE_STREAM_LIMIT
+        )
+        if previous_flate_limit is not None:
+            pypdf_filters.FLATE_MAX_BUFFER_SIZE = max(
+                previous_flate_limit, _LARGE_STREAM_LIMIT
+            )
+        try:
+            images = _collect_images(writer, result)
+        finally:
+            pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = previous_stream_limit
+            if previous_flate_limit is not None:
+                pypdf_filters.FLATE_MAX_BUFFER_SIZE = previous_flate_limit
         result.total_images = len(images) + result.skipped_inline
+        page_profiles: dict[int, bool] = {}
+        if options.advanced_processing:
+            page_scores: dict[int, list[bool]] = {}
+            for page_number, image_file in images:
+                image = image_file.image
+                if image is not None:
+                    needs_denoise, _ = _advanced_profile(image)
+                    page_scores.setdefault(page_number, []).append(needs_denoise)
+            page_profiles = {
+                page_number: sum(scores) > len(scores) / 2
+                for page_number, scores in page_scores.items()
+            }
+        conversion_errors: list[str] = []
+        work_items: list[tuple[int, object, Image.Image, OptimizeOptions]] = []
 
-        for index, image_file in enumerate(images, start=1):
+        for index, (page_number, image_file) in enumerate(images, start=1):
             if cancel_event is not None and cancel_event.is_set():
                 raise CancelledError("処理を中止しました。")
-            if progress:
-                progress(f"画像 {index}/{len(images)} を処理中", index - 1, len(images))
-
             try:
                 image = image_file.image
                 if image is None:
@@ -242,19 +320,81 @@ def optimize_pdf(
                 if image.mode == "1" and bits == 1 and width <= max_w and height <= max_h:
                     continue
 
-                binary, _ = _prepare_image(image, options)
-                image_file.replace(binary)
-                result.converted_images += 1
-            except (OSError, ValueError, TypeError, MemoryError, PdfReadError) as exc:
+                image_options = options
+                if options.advanced_processing:
+                    noisy_page = page_profiles.get(page_number, False)
+                    image_options = replace(
+                        options,
+                        denoise=options.denoise or noisy_page,
+                        threshold_offset=options.threshold_offset + (-10 if noisy_page else 0),
+                    )
+                work_items.append((index, image_file, image, image_options))
+            except (
+                OSError,
+                ValueError,
+                TypeError,
+                MemoryError,
+                LimitReachedError,
+                PdfReadError,
+            ) as exc:
                 result.skipped_unsupported += 1
-                result.warnings.append(
+                message = (
                     f"画像 {index} ({getattr(image_file, 'name', '?')}): "
                     f"{type(exc).__name__} - {exc}"
                 )
+                result.warnings.append(message)
+                conversion_errors.append(message)
+
+        # PIL processing releases the GIL in its expensive C operations. Keep
+        # pypdf writer mutation below serialized to avoid corrupting its object graph.
+        worker_count = min(2, len(work_items))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count or 1) as pool:
+            futures = [
+                pool.submit(_prepare_image_task, image, image_options)
+                for _, _, image, image_options in work_items
+            ]
+            for (index, image_file, _, _), future in zip(work_items, futures):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise CancelledError("処理を中止しました。")
+                if progress:
+                    progress(f"画像 {index}/{len(images)} を処理中", index - 1, len(images))
+                try:
+                    binary, _ = future.result()
+                    image_file.replace(binary)
+                    if image_file.image is None or image_file.image.mode != "1":
+                        raise ValueError("2値画像への差し替え結果を検証できません")
+                    if image_file.image.size != binary.size:
+                        raise ValueError(
+                            f"差し替え後の寸法が不一致です ({image_file.image.size} != {binary.size})"
+                        )
+                    result.converted_images += 1
+                except (
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    MemoryError,
+                    LimitReachedError,
+                    PdfReadError,
+                ) as exc:
+                    result.skipped_unsupported += 1
+                    message = (
+                        f"画像 {index} ({getattr(image_file, 'name', '?')}): "
+                        f"{type(exc).__name__} - {exc}"
+                    )
+                    result.warnings.append(message)
+                    conversion_errors.append(message)
 
         if progress:
             progress("PDFを保存中", len(images), len(images))
-        writer.compress_identical_objects(remove_identicals=True, remove_orphans=True)
+        if conversion_errors:
+            raise RuntimeError(
+                "画像変換に失敗したため、混在したPDFを保存せず中止しました。\n"
+                + "\n".join(conversion_errors[:10])
+                + (f"\n（ほか {len(conversion_errors) - 10}件）" if len(conversion_errors) > 10 else "")
+            )
+        # ponytail: skip global object deduplication; it re-decompresses huge streams,
+        # and the drawing images are already replaced above. Re-enable only if output
+        # size becomes a measured problem and large-stream handling is added.
         with temporary.open("wb") as stream:
             writer.write(stream)
         writer.close()

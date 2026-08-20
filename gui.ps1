@@ -19,8 +19,8 @@ function Quote-Argument([string]$value) {
 
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "図面PDF 画像2値化"
-$form.Size = New-Object System.Drawing.Size(820, 650)
-$form.MinimumSize = New-Object System.Drawing.Size(720, 560)
+$form.Size = New-Object System.Drawing.Size(820, 680)
+$form.MinimumSize = New-Object System.Drawing.Size(720, 590)
 $form.StartPosition = "CenterScreen"
 $form.Font = New-Object System.Drawing.Font("Yu Gothic UI", 9)
 
@@ -79,7 +79,7 @@ $outputGroup.Controls.Add($outputHint)
 $settings = New-Object System.Windows.Forms.GroupBox
 $settings.Text = "画像処理"
 $settings.Location = New-Object System.Drawing.Point(12, 342)
-$settings.Size = New-Object System.Drawing.Size(776, 160)
+$settings.Size = New-Object System.Drawing.Size(776, 190)
 $settings.Anchor = "Top,Left,Right"
 $form.Controls.Add($settings)
 
@@ -160,22 +160,28 @@ $stripMetadata.AutoSize = $true
 $stripMetadata.Checked = $true
 $settings.Controls.Add($stripMetadata)
 
+$advanced = New-Object System.Windows.Forms.CheckBox
+$advanced.Text = "高度処理（時間がかかります）"
+$advanced.Location = New-Object System.Drawing.Point(12, 148)
+$advanced.AutoSize = $true
+$settings.Controls.Add($advanced)
+
 $progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Location = New-Object System.Drawing.Point(12, 518)
+$progress.Location = New-Object System.Drawing.Point(12, 548)
 $progress.Size = New-Object System.Drawing.Size(555, 25)
 $progress.Anchor = "Top,Left,Right"
 $form.Controls.Add($progress)
 
 $startButton = New-Object System.Windows.Forms.Button
 $startButton.Text = "最適化を開始"
-$startButton.Location = New-Object System.Drawing.Point(575, 514)
+$startButton.Location = New-Object System.Drawing.Point(575, 544)
 $startButton.Size = New-Object System.Drawing.Size(125, 32)
 $startButton.Anchor = "Top,Right"
 $form.Controls.Add($startButton)
 
 $cancelButton = New-Object System.Windows.Forms.Button
 $cancelButton.Text = "中止"
-$cancelButton.Location = New-Object System.Drawing.Point(706, 514)
+$cancelButton.Location = New-Object System.Drawing.Point(706, 544)
 $cancelButton.Size = New-Object System.Drawing.Size(82, 32)
 $cancelButton.Anchor = "Top,Right"
 $cancelButton.Enabled = $false
@@ -183,7 +189,7 @@ $form.Controls.Add($cancelButton)
 
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = "PDFを追加してください。"
-$statusLabel.Location = New-Object System.Drawing.Point(12, 557)
+$statusLabel.Location = New-Object System.Drawing.Point(12, 587)
 $statusLabel.Size = New-Object System.Drawing.Size(776, 40)
 $statusLabel.Anchor = "Top,Left,Right"
 $form.Controls.Add($statusLabel)
@@ -291,6 +297,7 @@ $startAction = {
     if (-not $autoContrast.Checked) { $arguments += "--no-auto-contrast" }
     if (-not $sharpen.Checked) { $arguments += "--no-sharpen" }
     if ($includeSmall.Checked) { $arguments += "--include-small" }
+    if ($advanced.Checked) { $arguments += "--advanced" }
     if (-not $stripMetadata.Checked) { $arguments += "--keep-metadata" }
     foreach ($file in $fileList.Items) { $arguments += Quote-Argument ([string]$file) }
 

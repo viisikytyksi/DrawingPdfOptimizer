@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from engine import OptimizeOptions, optimize_pdf
+from version import __version__
 
 
 def output_path(source: Path, folder: Path | None) -> Path:
@@ -19,6 +20,7 @@ def output_path(source: Path, folder: Path | None) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--dpi", type=int, choices=(200, 300, 400), default=300)
@@ -26,6 +28,8 @@ def main() -> int:
     parser.add_argument("--threshold", type=int, default=0)
     parser.add_argument("--no-auto-contrast", action="store_true")
     parser.add_argument("--no-sharpen", action="store_true")
+    parser.add_argument("--denoise", action="store_true")
+    parser.add_argument("--advanced", action="store_true", help="縮小判定による高度処理")
     parser.add_argument("--include-small", action="store_true")
     parser.add_argument("--keep-metadata", action="store_true")
     args = parser.parse_args()
@@ -35,6 +39,8 @@ def main() -> int:
         auto_contrast=not args.no_auto_contrast,
         contrast=max(1.0, min(1.5, args.contrast)),
         sharpen=not args.no_sharpen,
+        denoise=args.denoise,
+        advanced_processing=args.advanced,
         threshold_offset=max(-30, min(30, args.threshold)),
         include_small_images=args.include_small,
         strip_metadata=not args.keep_metadata,
