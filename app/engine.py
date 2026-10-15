@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import io
+import math
 import os
+import struct
 import threading
 import concurrent.futures
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps
+from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, features as pil_features
 from pypdf import PdfWriter, filters as pypdf_filters
 from pypdf.errors import LimitReachedError, PdfReadError
-from pypdf.generic import NameObject, DictionaryObject, TextStringObject
+from pypdf.generic import (
+    ArrayObject,
+    BooleanObject,
+    DictionaryObject,
+    NameObject,
+    NumberObject,
+    StreamObject,
+    TextStringObject,
+)
 
 
 ProgressCallback = Callable[[str, int, int], None]
@@ -156,6 +167,98 @@ def _advanced_profile(image: Image.Image) -> tuple[bool, float]:
 
 def _prepare_image_task(image: Image.Image, options: OptimizeOptions) -> tuple[Image.Image, int]:
     return _prepare_image(image, options)
+
+
+def _encode_ccitt_g4(image: Image.Image) -> bytes | None:
+    """Return a CCITT Group 4 stream for a 1bit image, or None when unavailable.
+
+    Reuses Pillow's TIFF Group 4 encoder (libtiff) with a single strip — the same
+    route Pillow's own PDF writer takes for 1bit images — and slices the strip out
+    of the TIFF container. Reading the strip bounds from the produced tags keeps
+    this correct if Pillow ever changes the TIFF layout.
+    """
+    if not pil_features.check("libtiff"):
+        return None
+    width, height = image.size
+    buffer = io.BytesIO()
+    try:
+        image.save(
+            buffer, "TIFF", compression="group4", strip_size=math.ceil(width / 8) * height
+        )
+    except (OSError, ValueError):
+        return None
+    raw = buffer.getvalue()
+    if len(raw) < 8 or raw[:4] != b"II*\x00":
+        return None
+    ifd_offset = struct.unpack("<I", raw[4:8])[0]
+    if ifd_offset + 2 > len(raw):
+        return None
+    tag_count = struct.unpack("<H", raw[ifd_offset : ifd_offset + 2])[0]
+    tags: dict[int, int] = {}
+    for index in range(tag_count):
+        offset = ifd_offset + 2 + index * 12
+        if offset + 12 > len(raw):
+            return None
+        tag = struct.unpack("<H", raw[offset : offset + 2])[0]
+        tags[tag] = struct.unpack("<I", raw[offset + 8 : offset + 12])[0]
+    strip_offset = tags.get(273)  # StripOffsets
+    strip_bytes = tags.get(279)  # StripByteCounts
+    if strip_offset != 8 or not strip_bytes or tags.get(278) != height:  # RowsPerStrip
+        return None
+    strip = raw[strip_offset : strip_offset + strip_bytes]
+    return strip or None
+
+
+def _replace_with_ccitt(image_file: object, binary: Image.Image) -> bool:
+    """Write the prepared 1bit image into its existing XObject as CCITT G4.
+
+    pypdf's ImageFile.replace() round-trips the image through a temporary PDF
+    (Pillow write, parse, decode, re-encode). Writing the stream in place keeps
+    the same bytes with a single encode. Returns False when the fast path is not
+    usable, so the caller can fall back to replace().
+    """
+    reference = getattr(image_file, "indirect_reference", None)
+    if reference is None:
+        return False
+    stream = _encode_ccitt_g4(binary)
+    if stream is None:
+        return False
+    try:
+        stream_object = reference.get_object()
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(stream_object, StreamObject) or stream_object.get("/Subtype") != "/Image":
+        return False
+    width, height = binary.size
+    # pypdf compresses Flate through set_data(); assign the encoded bytes directly.
+    stream_object._data = stream
+    stream_object[NameObject("/Type")] = NameObject("/XObject")
+    stream_object[NameObject("/Subtype")] = NameObject("/Image")
+    stream_object[NameObject("/Width")] = NumberObject(width)
+    stream_object[NameObject("/Height")] = NumberObject(height)
+    stream_object[NameObject("/BitsPerComponent")] = NumberObject(1)
+    stream_object[NameObject("/ColorSpace")] = NameObject("/DeviceGray")
+    stream_object[NameObject("/Filter")] = ArrayObject([NameObject("/CCITTFaxDecode")])
+    stream_object[NameObject("/DecodeParms")] = ArrayObject(
+        [
+            DictionaryObject(
+                {
+                    NameObject("/K"): NumberObject(-1),
+                    NameObject("/BlackIs1"): BooleanObject(True),
+                    NameObject("/Columns"): NumberObject(width),
+                    NameObject("/Rows"): NumberObject(height),
+                }
+            )
+        ]
+    )
+    # The prepared image is already composited on white; the old mask and decode
+    # mapping belong to the replaced bitmap.
+    for key in ("/SMask", "/Mask", "/Decode", "/Interpolate", "/Intent"):
+        if key in stream_object:
+            del stream_object[NameObject(key)]
+    image_file.image = binary
+    image_file.data = stream
+    return True
 
 
 def _image_key(image_file: object) -> tuple[int, int] | None:
@@ -360,7 +463,8 @@ def optimize_pdf(
                     progress(f"画像 {index}/{len(images)} を処理中", index - 1, len(images))
                 try:
                     binary, _ = future.result()
-                    image_file.replace(binary)
+                    if not _replace_with_ccitt(image_file, binary):
+                        image_file.replace(binary)
                     if image_file.image is None or image_file.image.mode != "1":
                         raise ValueError("2値画像への差し替え結果を検証できません")
                     if image_file.image.size != binary.size:
