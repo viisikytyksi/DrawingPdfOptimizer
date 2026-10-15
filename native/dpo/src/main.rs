@@ -300,14 +300,17 @@ fn process_image(
     let t_ops = Instant::now();
 
     let (max_width, max_height) = pipeline::a3_pixel_box(decoded.width, decoded.height, opts.dpi);
-    let (rgb, width, height) = pipeline::resize_rgb(
-        &decoded.rgb,
+    // The pipeline only ever reads the R channel, so extracting gray here keeps
+    // the resized pixels byte-identical while resizing one channel instead of three.
+    let gray: Vec<u8> = decoded.rgb.iter().step_by(3).copied().collect();
+    let (gray, width, height) = pipeline::resize_gray(
+        &gray,
         decoded.width,
         decoded.height,
         max_width,
         max_height,
     );
-    let binary = pipeline::binarize_rgb(&rgb, width, height, opts);
+    let binary = pipeline::binarize_gray(gray, width, height, opts);
     totals
         .ops_ms
         .fetch_add(t_ops.elapsed().as_millis() as u64, Ordering::Relaxed);

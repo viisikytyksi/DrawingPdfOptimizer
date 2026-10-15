@@ -18,6 +18,9 @@ pub mod timing {
     pub static BINARIZE: AtomicU64 = AtomicU64::new(0);
     pub static DESPECKLE: AtomicU64 = AtomicU64::new(0);
     pub static RESIZE: AtomicU64 = AtomicU64::new(0);
+    pub static RESIZE_REDUCE: AtomicU64 = AtomicU64::new(0);
+    pub static RESIZE_H: AtomicU64 = AtomicU64::new(0);
+    pub static RESIZE_V: AtomicU64 = AtomicU64::new(0);
 
     pub fn add(counter: &AtomicU64, elapsed: std::time::Duration) {
         counter.fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
@@ -25,7 +28,7 @@ pub mod timing {
 
     pub fn report() -> String {
         format!(
-            "pipeline: resize={}ms blur={}ms subtract={}ms autocontrast={}ms contrast={}ms unsharp={}ms otsu={}ms binarize={}ms despeckle={}ms",
+            "pipeline: resize={}ms blur={}ms subtract={}ms autocontrast={}ms contrast={}ms unsharp={}ms otsu={}ms binarize={}ms despeckle={}ms resize_reduce={}ms resize_h={}ms resize_v={}ms",
             RESIZE.load(Ordering::Relaxed),
             BLUR.load(Ordering::Relaxed),
             SUBTRACT.load(Ordering::Relaxed),
@@ -35,6 +38,9 @@ pub mod timing {
             OTSU.load(Ordering::Relaxed),
             BINARIZE.load(Ordering::Relaxed),
             DESPECKLE.load(Ordering::Relaxed),
+            RESIZE_REDUCE.load(Ordering::Relaxed),
+            RESIZE_H.load(Ordering::Relaxed),
+            RESIZE_V.load(Ordering::Relaxed),
         )
     }
 }
@@ -548,25 +554,20 @@ fn despeckle_pass(pixels: &mut [u8], w: usize, h: usize, min_neighbours: u32) {
     }
 }
 
-/// Whole `_prepare_image()` pipeline on an already decoded RGB image.
-pub fn binarize_rgb(rgb: &[u8], w: u32, h: u32, opts: &Options) -> Binary {
-    let (wu, hu) = (w as usize, h as usize);
-    // gray = working.getchannel("R")
-    let gray: Vec<u8> = (0..wu * hu).map(|i| rgb[i * 3]).collect();
-    binarize_gray(gray, w, h, opts)
-}
-
-pub fn resize_rgb(rgb: &[u8], w: u32, h: u32, max_w: u32, max_h: u32) -> (Vec<u8>, u32, u32) {
+pub fn resize_gray(gray: &[u8], w: u32, h: u32, max_w: u32, max_h: u32) -> (Vec<u8>, u32, u32) {
     let started = std::time::Instant::now();
-    let result = resize_rgb_inner(rgb, w, h, max_w, max_h);
+    // planes = 1: the pipeline only ever reads the R channel of the resized RGB,
+    // so resizing the single channel produces byte-identical input to
+    // `_prepare_image` while doing a third of the arithmetic.
+    let result = resize_plane(gray, w, h, max_w, max_h, 1);
     timing::add(&timing::RESIZE, started.elapsed());
     result
 }
 
 /// Lanczos3 downscale, mirroring `Image.thumbnail(max_size, LANCZOS)`.
-fn resize_rgb_inner(rgb: &[u8], w: u32, h: u32, max_w: u32, max_h: u32) -> (Vec<u8>, u32, u32) {
+fn resize_plane(src: &[u8], w: u32, h: u32, max_w: u32, max_h: u32, planes: usize) -> (Vec<u8>, u32, u32) {
     if w <= max_w && h <= max_h {
-        return (rgb.to_vec(), w, h);
+        return (src.to_vec(), w, h);
     }
     let aspect = w as f64 / h as f64;
     let (tw, th) = if (max_w as f64 / max_h as f64) >= aspect {
@@ -585,11 +586,13 @@ fn resize_rgb_inner(rgb: &[u8], w: u32, h: u32, max_w: u32, max_h: u32) -> (Vec<
     // reduction first (cheap, and it antialiases), then Lanczos3 on an image that
     // is only about twice the target. Running the kernel straight on a 9000px
     // wide strip is what made this the hot spot.
-    let mut source = rgb.to_vec();
+    let mut source = src.to_vec();
     let (mut sw, mut sh) = (w, h);
     let factor = ((w / tw).min(h / th)).max(1);
     if factor >= 2 {
-        let (reduced, rw, rh) = reduce_rgb(&source, sw, sh, factor);
+        let started = std::time::Instant::now();
+        let (reduced, rw, rh) = reduce_plane(&source, sw, sh, factor, planes);
+        timing::add(&timing::RESIZE_REDUCE, started.elapsed());
         source = reduced;
         sw = rw;
         sh = rh;
@@ -597,33 +600,34 @@ fn resize_rgb_inner(rgb: &[u8], w: u32, h: u32, max_w: u32, max_h: u32) -> (Vec<
     if sw == tw && sh == th {
         return (source, tw, th);
     }
-    (lanczos3_rgb(&source, sw, sh, tw, th), tw, th)
+    (lanczos3_plane(&source, sw, sh, tw, th, planes), tw, th)
 }
 
 /// Pillow's `Image.reduce(factor)`: average factor x factor blocks (rounded).
-fn reduce_rgb(rgb: &[u8], w: u32, h: u32, factor: u32) -> (Vec<u8>, u32, u32) {
+fn reduce_plane(src: &[u8], w: u32, h: u32, factor: u32, planes: usize) -> (Vec<u8>, u32, u32) {
     use rayon::prelude::*;
     let (wu, hu, f) = (w as usize, h as usize, factor as usize);
     let (tw, th) = (wu / f, hu / f);
+    let out_w = tw * planes;
     let area = (f * f) as u32;
-    let mut out = vec![0u8; tw * th * 3];
-    out.par_chunks_mut(tw * 3)
+    let mut out = vec![0u8; out_w * th];
+    out.par_chunks_mut(out_w)
         .enumerate()
-        .for_each(|(ty, row)| {
+        .for_each(|(ty, out_row)| {
             for tx in 0..tw {
                 let mut sums = [0u32; 3];
                 for y in ty * f..(ty + 1) * f {
-                    let base = y * wu * 3;
+                    let base = y * wu * planes;
                     for x in tx * f..(tx + 1) * f {
-                        let offset = base + x * 3;
-                        sums[0] += rgb[offset] as u32;
-                        sums[1] += rgb[offset + 1] as u32;
-                        sums[2] += rgb[offset + 2] as u32;
+                        let offset = base + x * planes;
+                        for channel in 0..planes {
+                            sums[channel] += src[offset + channel] as u32;
+                        }
                     }
                 }
-                let base = tx * 3;
-                for channel in 0..3 {
-                    row[base + channel] = ((sums[channel] + area / 2) / area) as u8;
+                let base = tx * planes;
+                for channel in 0..planes {
+                    out_row[base + channel] = ((sums[channel] + area / 2) / area) as u8;
                 }
             }
         });
@@ -631,38 +635,42 @@ fn reduce_rgb(rgb: &[u8], w: u32, h: u32, factor: u32) -> (Vec<u8>, u32, u32) {
 }
 
 /// Separable Lanczos3 with precomputed coefficients (no sin() in the inner loop),
-/// parallel over rows.
-fn lanczos3_rgb(rgb: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
+/// parallel over rows.  Per-channel arithmetic is identical for every plane
+/// count, so the single-channel pipeline keeps Pillow's sums bit-for-bit.
+fn lanczos3_plane(src: &[u8], w: u32, h: u32, tw: u32, th: u32, planes: usize) -> Vec<u8> {
     use rayon::prelude::*;
     let (wu, hu, twu, thu) = (w as usize, h as usize, tw as usize, th as usize);
     let (h_starts, h_weights) = build_weights(wu, twu);
     let (v_starts, v_weights) = build_weights(hu, thu);
 
-    let mut horizontal = vec![0u8; twu * hu * 3];
+    let started_h = std::time::Instant::now();
+    let mut horizontal = vec![0u8; twu * hu * planes];
     horizontal
-        .par_chunks_mut(twu * 3)
+        .par_chunks_mut(twu * planes)
         .enumerate()
         .for_each(|(y, out_row)| {
-            let src_row = &rgb[y * wu * 3..(y + 1) * wu * 3];
+            let src_row = &src[y * wu * planes..(y + 1) * wu * planes];
             for tx in 0..twu {
                 let start = h_starts[tx];
                 let weights = &h_weights[tx];
                 let mut sums = [0.0f64; 3];
                 for (index, weight) in weights.iter().enumerate() {
-                    let base = (start + index) * 3;
-                    sums[0] += weight * src_row[base] as f64;
-                    sums[1] += weight * src_row[base + 1] as f64;
-                    sums[2] += weight * src_row[base + 2] as f64;
+                    let base = (start + index) * planes;
+                    for channel in 0..planes {
+                        sums[channel] += weight * src_row[base + channel] as f64;
+                    }
                 }
-                let base = tx * 3;
-                for channel in 0..3 {
+                let base = tx * planes;
+                for channel in 0..planes {
                     out_row[base + channel] = sums[channel].round().clamp(0.0, 255.0) as u8;
                 }
             }
         });
+    timing::add(&timing::RESIZE_H, started_h.elapsed());
 
-    let mut out = vec![0u8; twu * thu * 3];
-    out.par_chunks_mut(twu * 3)
+    let started_v = std::time::Instant::now();
+    let mut out = vec![0u8; twu * thu * planes];
+    out.par_chunks_mut(twu * planes)
         .enumerate()
         .for_each(|(ty, out_row)| {
             let start = v_starts[ty];
@@ -670,17 +678,18 @@ fn lanczos3_rgb(rgb: &[u8], w: u32, h: u32, tw: u32, th: u32) -> Vec<u8> {
             for tx in 0..twu {
                 let mut sums = [0.0f64; 3];
                 for (index, weight) in weights.iter().enumerate() {
-                    let base = ((start + index) * twu + tx) * 3;
-                    sums[0] += weight * horizontal[base] as f64;
-                    sums[1] += weight * horizontal[base + 1] as f64;
-                    sums[2] += weight * horizontal[base + 2] as f64;
+                    let base = ((start + index) * twu + tx) * planes;
+                    for channel in 0..planes {
+                        sums[channel] += weight * horizontal[base + channel] as f64;
+                    }
                 }
-                let base = tx * 3;
-                for channel in 0..3 {
+                let base = tx * planes;
+                for channel in 0..planes {
                     out_row[base + channel] = sums[channel].round().clamp(0.0, 255.0) as u8;
                 }
             }
         });
+    timing::add(&timing::RESIZE_V, started_v.elapsed());
     out
 }
 
@@ -712,6 +721,32 @@ fn build_weights(in_len: usize, out_len: usize) -> (Vec<usize>, Vec<Vec<f64>>) {
     }
     (starts, table)
 }
+
+/// Pillow's `Image.reduce(factor)`: average factor x factor blocks (rounded).
+
+
+/// Separable Lanczos3 downscale, mirroring `Image.thumbnail(max_size, LANCZOS)`.
+///
+/// Bit-identical to a per-pixel formulation: every output pixel still sums its
+/// taps in ascending source order, so the accumulated doubles are the same. What
+/// changed is the traversal. The horizontal pass sweeps source columns and streams
+/// weights into per-channel accumulator lanes (vector-friendly, one branch per
+/// source pixel instead of per tap table lookup); the vertical pass walks taps as
+/// whole-row vector loops. Source RGB is split into 3 planes up front so every
+/// loop touches contiguous memory.
+
+
+/// Flat per-output-index weight tables: `starts[i]` (first source index), `lens[i]`
+/// taps starting at `offsets[i]` inside `weights`. Values are identical to the
+/// nested form.
+
+
+/// Per source column s, the contiguous destination window [k_lo(s), k_hi(s)] that
+/// reads s. Destination windows are monotone: starts[] and ends[] both rise, so
+/// the covering set is always contiguous. Sources covered by no window get an
+/// empty (1..=0) range. Weight values are then read directly from the forward
+/// table, keeping the accumulated doubles bit-identical.
+
 
 fn lanczos(x: f64) -> f64 {
     if x.abs() < 1e-9 {
@@ -798,5 +833,43 @@ mod tests {
         assert!((61..=69).all(|x| pixels[3 * 200 + x] == 0), "語境界をまたぐ線は残る");
         assert_eq!(pixels[3 * 200 + 60], 1, "端は削られる");
         assert_eq!(pixels[3 * 200 + 70], 1, "端は削られる");
+    }
+
+    #[test]
+    fn resize_gray_matches_rgb_r_channel() {
+        // リサイズの単チャネル化は、RGBの3チャネル版とRチャネルがビット一致すること。
+        // planes=3 と planes=1 に同じ R プレーンを流して比較する。
+        let (mw, mh) = (40usize, 30usize);
+        let mut rng_state = 123456789u64;
+        let mut rand = move || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            ((rng_state >> 24) & 0xff) as u8
+        };
+        // interleaved RGB where r = g = b = same plane (values don't matter for the check)
+        let p: Vec<u8> = (0..mw * mh).map(|_| rand()).collect();
+        let mut rgb = Vec::with_capacity(mw * mh * 3);
+        for v in &p {
+            rgb.push(*v);
+            rgb.push(*v);
+            rgb.push(*v);
+        }
+        for &(tw, th) in &[(33usize, 25usize), (40usize, 30usize), (20usize, 15usize)] {
+            if tw >= mw && th >= mh {
+                continue;
+            }
+            let (a, w1, h1) = resize_plane(&rgb, mw as u32, mh as u32, tw as u32, th as u32, 3);
+            if tw == mw && th == mh {
+                continue;
+            }
+            let (b, w2, h2) = resize_plane(&p, mw as u32, mh as u32, tw as u32, th as u32, 1);
+            assert_eq!((w1, h1), (w2, h2));
+            for ((ra, rb)) in a.chunks_exact(3).zip(b.iter()) {
+                assert_eq!(ra[0], *rb, "Rチャネルの不一致 tw={} th={}", tw, th);
+                assert_eq!(ra[1], *rb, "GチャネルはRと同じ値のはず");
+                assert_eq!(ra[2], *rb, "BチャネルはRと同じ値のはず");
+            }
+        }
     }
 }
