@@ -299,6 +299,8 @@ $browseButton.Add_Click({
 
 $script:logWarnPath = ""
 $script:logWarnError = ""
+$script:logMovedPath = ""
+$script:fileErrors = @()
 
 $script:progressLine = { param([string]$line)
     if ([string]::IsNullOrWhiteSpace($line)) { return }
@@ -322,6 +324,14 @@ $script:progressLine = { param([string]$line)
             }
             "all_done" {
                 $progress.Value = 100
+            }
+            "file_error" {
+                $script:fileErrors += "$($ev.name): $($ev.error)"
+                $statusLabel.Text = "[$($ev.file)/$($ev.total_files)] $($ev.name) 失敗: $($ev.error)"
+            }
+            "log_moved" {
+                $script:logMovedPath = [string]$ev.path
+                $statusLabel.Text = "警告: ログの保存先を変更しました（$($ev.path)）"
             }
             "log_error" {
                 if (-not $script:logWarnError) {
@@ -365,8 +375,11 @@ $timer.Add_Tick({
         if ($exitCode -ne 0) {
             $progress.Value = 0
             $statusLabel.Text = "エラーで停止しました。"
-            $errText = if ($stderr) { $stderr } else { "不明なエラー" }
-            [System.Windows.Forms.MessageBox]::Show($errText, "図面PDF 画像2値化", "OK", "Error")
+            $errText = (($stderr -split "`r?`n") | Where-Object { $_.Trim() -ne "" -and -not $_.TrimStart().StartsWith("{") }) -join "`n"
+            if (-not $errText) {
+                $errText = if ($script:fileErrors.Count -gt 0) { $script:fileErrors -join "`n" } else { "不明なエラー" }
+            }
+            [System.Windows.Forms.MessageBox]::Show($errText, "図面PDF 画像2値化 v$appVersion", "OK", "Error")
             return
         }
         try {
@@ -378,10 +391,19 @@ $timer.Add_Tick({
             $percent = if ($before -gt 0) { [Math]::Round((1 - $after / $before) * 100) } else { 0 }
             $statusLabel.Text = "完了: $($results.Count)ファイル、$converted 画像を2値化"
             $message = "$($results.Count)ファイルを保存しました。`n2値化した画像: $converted`n容量: $([Math]::Round($before / 1MB, 1)) MB → $([Math]::Round($after / 1MB, 1)) MB（$percent%削減）"
+            $warnings = @()
+            if ($script:fileErrors.Count -gt 0) {
+                $warnings += "【失敗】$($script:fileErrors.Count)件のファイルを処理できませんでした。`n" + (($script:fileErrors | ForEach-Object { "・$_" }) -join "`n")
+                $statusLabel.Text = "完了（$($script:fileErrors.Count)件失敗）: $($results.Count)ファイル、$converted 画像を2値化"
+            }
+            if ($script:logMovedPath) {
+                $warnings += "【注意】処理ログの保存先を変更しました。`n新しい保存先: $($script:logMovedPath)"
+            }
             if ($script:logWarnError) {
-                $statusLabel.Text = "完了（処理ログの保存に失敗）: $($results.Count)ファイル、$converted 画像を2値化"
-                $warning = "【警告】処理ログを保存できませんでした。`n`n保存先: $($script:logWarnPath)`nエラー: $($script:logWarnError)`n`nPDFの処理そのものは完了しています。この処理の記録は残っていません。配布元へ連絡してください。`n`n"
-                [System.Windows.Forms.MessageBox]::Show($warning + $message, "図面PDF 画像2値化 v$appVersion", "OK", "Warning")
+                $warnings += "【警告】処理ログを保存できませんでした。`n保存先: $($script:logWarnPath)`nエラー: $($script:logWarnError)`nこの処理の記録は残っていません。配布元へ連絡してください。"
+            }
+            if ($warnings.Count -gt 0) {
+                [System.Windows.Forms.MessageBox]::Show(($warnings -join "`n`n") + "`n`n" + $message, "図面PDF 画像2値化 v$appVersion", "OK", "Warning")
             } else {
                 [System.Windows.Forms.MessageBox]::Show($message, "図面PDF 画像2値化 v$appVersion", "OK", "Information")
             }
@@ -403,10 +425,13 @@ $startAction = {
 
     $script:logWarnPath = ""
     $script:logWarnError = ""
+    $script:logMovedPath = ""
+    $script:fileErrors = @()
     $script:logDest = Resolve-LogDest
 
     $arguments = @((Quote-Argument $cliScript), "--progress",
         "--log-dir", (Quote-Argument $script:logDest),
+        "--log-fallback-dir", (Quote-Argument $appRoot),
         "--fullname", (Quote-Argument $script:userFullname),
         "--dpi", $dpiCombo.SelectedItem, "--contrast", ($contrastTrack.Value / 100.0), "--threshold", $thresholdTrack.Value)
     if ($outputText.Text) { $arguments += @("--output-dir", (Quote-Argument $outputText.Text)) }

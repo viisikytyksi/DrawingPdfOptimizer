@@ -181,6 +181,7 @@ class OptimizerApp(tk.Tk):
 
     def _run_batch(self, files: list[Path], output: str, options: OptimizeOptions) -> None:
         results: list[OptimizeResult] = []
+        failures: list[str] = []
         try:
             for file_index, source in enumerate(files):
                 if self._cancel.is_set():
@@ -190,16 +191,24 @@ class OptimizerApp(tk.Tk):
                     fraction = (current / total) if total else 0
                     self._events.put(("progress", (file_index + fraction, len(files), source.name, message)))
 
-                result = optimize_pdf(
-                    source,
-                    self._output_path(source, output),
-                    options,
-                    progress=progress,
-                    cancel_event=self._cancel,
-                )
+                try:
+                    result = optimize_pdf(
+                        source,
+                        self._output_path(source, output),
+                        options,
+                        progress=progress,
+                        cancel_event=self._cancel,
+                    )
+                except CancelledError:
+                    raise
+                except Exception as exc:
+                    # 1件の失敗で残りを止めない
+                    failures.append(f"{source.name}: {type(exc).__name__}: {exc}")
+                    self._events.put(("progress", (file_index + 1, len(files), source.name, "失敗")))
+                    continue
                 results.append(result)
                 self._events.put(("progress", (file_index + 1, len(files), source.name, "完了")))
-            self._events.put(("done", results))
+            self._events.put(("done", (results, failures)))
         except CancelledError as exc:
             self._events.put(("cancelled", str(exc)))
         except Exception:
@@ -231,7 +240,8 @@ class OptimizerApp(tk.Tk):
             pass
         self.after(100, self._poll_events)
 
-    def _finish(self, results: list[OptimizeResult]) -> None:
+    def _finish(self, payload: tuple[list[OptimizeResult], list[str]]) -> None:
+        results, failures = payload
         self._reset_buttons()
         converted = sum(result.converted_images for result in results)
         before = sum(result.bytes_before for result in results)
@@ -247,6 +257,10 @@ class OptimizerApp(tk.Tk):
         )
         if warning_count:
             message += f"\n\n処理できなかった画像・注意事項: {warning_count}件"
+        if failures:
+            message += "\n\n【失敗】" + str(len(failures)) + "件\n" + "\n".join(f"・{line}" for line in failures)
+            messagebox.showwarning(APP_NAME, message)
+            return
         messagebox.showinfo(APP_NAME, message)
 
     def _reset_buttons(self) -> None:
@@ -266,7 +280,7 @@ def main() -> int:
     if len(sys.argv) == 3 and sys.argv[1] == "--optimize":
         source = Path(sys.argv[2])
         target = source.with_name(f"{source.stem}_2値化.pdf")
-        result = optimize_pdf(source, target, OptimizeOptions())
+        result = optimize_pdf(source, target, OptimizeOptions(denoise=True))
         print(target)
         print(f"converted={result.converted_images}")
         return 0
