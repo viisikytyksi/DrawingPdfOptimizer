@@ -26,4 +26,4 @@ desktop.ini
 
 # Rust (native engine)
 /native/dpo/target/
-/native/dpo/.cargo/config.toml
+# .cargo/config.toml は x86-64-v3 固定の追跡対象（2026-10-16からの恒久設定）

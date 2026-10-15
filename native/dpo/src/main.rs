@@ -737,6 +737,12 @@ impl ProgressEmitter {
 }
 
 fn main() {
+    // このビルドは x86-64-v3 (AVX2/FMA) を前提とする。対応しないCPUでは
+    // 不正命令で落ちる代わりに、ここで明示的に止める。
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        eprintln!("エラー: このバイナリはAVX2(x86-64-v3)対応CPUが必要です");
+        std::process::exit(1);
+    }
     let args = parse_args();
     if args.inputs.is_empty() {
         usage();
