@@ -48,8 +48,13 @@ def _log_path(log_dir: Path | None, output_dir: Path | None, source: Path) -> Pa
     return dest / _LOG_NAME
 
 
-def _append_log(log_path: Path, row: list[str]) -> None:
-    """Append a single CSV row to the log file. Never raises."""
+def _append_log(log_path: Path, row: list[str]) -> str:
+    """Append a single CSV row to the log file.
+
+    Never raises and never fails the run. Returns "" on success, or the error
+    message when the row could not be written (NAS unreachable, read-only
+    share, missing folder), so the caller can surface the gap.
+    """
     try:
         write_header = not log_path.exists() or log_path.stat().st_size == 0
         with log_path.open("a", newline="", encoding="shift_jis", errors="replace") as f:
@@ -57,8 +62,9 @@ def _append_log(log_path: Path, row: list[str]) -> None:
             if write_header:
                 writer.writerow(_LOG_HEADER)
             writer.writerow(row)
-    except OSError:
-        pass  # NAS may be briefly unavailable; don't fail the run for logging
+    except OSError as exc:
+        return f"{type(exc).__name__}: {exc}"
+    return ""
 
 
 def main() -> int:
@@ -103,6 +109,7 @@ def main() -> int:
     pstream = sys.stderr if args.progress else None
     results = []
     log_path = _log_path(args.log_dir, args.output_dir, args.inputs[0]) if args.inputs else None
+    log_error_reported = False
     user = getpass.getuser()
     fullname = args.fullname
     hostname = socket.gethostname()
@@ -145,7 +152,7 @@ def main() -> int:
                 }
             )
         if log_path:
-            _append_log(log_path, [
+            log_error = _append_log(log_path, [
                 datetime.now().isoformat(timespec="seconds"),
                 __version__, user, fullname, hostname, str(source),
                 source.stat().st_size,
@@ -157,6 +164,12 @@ def main() -> int:
                 round(elapsed, 1),
                 args.dpi, status, error_msg,
             ])
+            if log_error and not log_error_reported:
+                log_error_reported = True
+                if pstream:
+                    _emit_progress(pstream, "log_error", path=str(log_path), error=log_error)
+                else:
+                    print(f"警告: 処理ログを保存できません: {log_path} ({log_error})", file=sys.stderr)
         if pstream:
             _emit_progress(pstream, "file_done", file=file_index + 1, total_files=len(args.inputs), name=source.name)
         if result is None:

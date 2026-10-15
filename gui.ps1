@@ -47,18 +47,22 @@ try {
     } catch {}
 }
 
-# Check NAS accessibility; fall back to app folder if unreachable
-$script:logDest = $script:logDir
-try {
-    if (-not (Test-Path -LiteralPath $script:logDir -PathType Container -ErrorAction Stop)) {
-        throw "NAS not accessible"
+# Check NAS accessibility; fall back to app folder if unreachable.
+# Re-run before every job so a NAS that dropped after startup is detected.
+function Resolve-LogDest {
+    try {
+        if (-not (Test-Path -LiteralPath $script:logDir -PathType Container -ErrorAction Stop)) {
+            throw "NAS not accessible"
+        }
+        $testFile = Join-Path $script:logDir "_.logtest"
+        [System.IO.File]::WriteAllText($testFile, "test", [System.Text.Encoding]::UTF8)
+        Remove-Item $testFile -Force
+        return $script:logDir
+    } catch {
+        return $appRoot
     }
-    $testFile = Join-Path $script:logDir "_.logtest"
-    [System.IO.File]::WriteAllText($testFile, "test", [System.Text.Encoding]::UTF8)
-    Remove-Item $testFile -Force
-} catch {
-    $script:logDest = $appRoot
 }
+$script:logDest = Resolve-LogDest
 
 function Quote-Argument([string]$value) {
     return '"' + $value.Replace('\', '\').Replace('"', '\"') + '"'
@@ -292,6 +296,9 @@ $browseButton.Add_Click({
     if ($folderDialog.ShowDialog() -eq "OK") { $outputText.Text = $folderDialog.SelectedPath }
 })
 
+$script:logWarnPath = ""
+$script:logWarnError = ""
+
 $script:progressLine = { param([string]$line)
     if ([string]::IsNullOrWhiteSpace($line)) { return }
     try {
@@ -314,6 +321,13 @@ $script:progressLine = { param([string]$line)
             }
             "all_done" {
                 $progress.Value = 100
+            }
+            "log_error" {
+                if (-not $script:logWarnError) {
+                    $script:logWarnPath = [string]$ev.path
+                    $script:logWarnError = [string]$ev.error
+                }
+                $statusLabel.Text = "警告: 処理ログを保存できません（$($ev.error)）"
             }
         }
     } catch {}
@@ -363,7 +377,13 @@ $timer.Add_Tick({
             $percent = if ($before -gt 0) { [Math]::Round((1 - $after / $before) * 100) } else { 0 }
             $statusLabel.Text = "完了: $($results.Count)ファイル、$converted 画像を2値化"
             $message = "$($results.Count)ファイルを保存しました。`n2値化した画像: $converted`n容量: $([Math]::Round($before / 1MB, 1)) MB → $([Math]::Round($after / 1MB, 1)) MB（$percent%削減）"
-            [System.Windows.Forms.MessageBox]::Show($message, "図面PDF 画像2値化 v$appVersion", "OK", "Information")
+            if ($script:logWarnError) {
+                $statusLabel.Text = "完了（処理ログの保存に失敗）: $($results.Count)ファイル、$converted 画像を2値化"
+                $warning = "【警告】処理ログを保存できませんでした。`n`n保存先: $($script:logWarnPath)`nエラー: $($script:logWarnError)`n`nPDFの処理そのものは完了しています。この処理の記録は残っていません。配布元へ連絡してください。`n`n"
+                [System.Windows.Forms.MessageBox]::Show($warning + $message, "図面PDF 画像2値化 v$appVersion", "OK", "Warning")
+            } else {
+                [System.Windows.Forms.MessageBox]::Show($message, "図面PDF 画像2値化 v$appVersion", "OK", "Information")
+            }
         } catch {
             $statusLabel.Text = "保存は完了しましたが、結果表示を解析できませんでした。"
         }
@@ -379,6 +399,10 @@ $startAction = {
         [System.Windows.Forms.MessageBox]::Show("保存先フォルダーが見つかりません。", "図面PDF 画像2値化", "OK", "Error")
         return
     }
+
+    $script:logWarnPath = ""
+    $script:logWarnError = ""
+    $script:logDest = Resolve-LogDest
 
     $arguments = @((Quote-Argument $cliScript), "--progress",
         "--log-dir", (Quote-Argument $script:logDest),
