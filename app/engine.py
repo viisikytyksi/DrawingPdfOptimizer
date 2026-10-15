@@ -586,7 +586,7 @@ def optimize_pdf(
                     conversion_errors.append(message)
 
         if progress:
-            progress("PDFを保存中", len(images), len(images))
+            progress("PDFを保存中", len(jobs), len(jobs))
         if conversion_errors:
             raise RuntimeError(
                 "画像変換に失敗したため、混在したPDFを保存せず中止しました。\n"
@@ -611,7 +611,7 @@ def optimize_pdf(
 
         os.replace(temporary, target)
         if progress:
-            progress("保存完了", len(images), len(images))
+            progress("保存完了", len(jobs), len(jobs))
 
         result.bytes_after = target.stat().st_size
         return result
