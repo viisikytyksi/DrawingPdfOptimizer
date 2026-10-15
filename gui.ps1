@@ -217,6 +217,13 @@ $advanced.Location = New-Object System.Drawing.Point(12, 148)
 $advanced.AutoSize = $true
 $settings.Controls.Add($advanced)
 
+$denoise = New-Object System.Windows.Forms.CheckBox
+$denoise.Text = "ノイズ除去（薄いスキャン向け・時間約2倍）"
+$denoise.Location = New-Object System.Drawing.Point(350, 148)
+$denoise.AutoSize = $true
+$denoise.Checked = $true
+$settings.Controls.Add($denoise)
+
 $progress = New-Object System.Windows.Forms.ProgressBar
 $progress.Location = New-Object System.Drawing.Point(12, 548)
 $progress.Size = New-Object System.Drawing.Size(555, 25)
@@ -413,6 +420,7 @@ $startAction = {
     if (-not $sharpen.Checked) { $arguments += "--no-sharpen" }
     if ($includeSmall.Checked) { $arguments += "--include-small" }
     if ($advanced.Checked) { $arguments += "--advanced" }
+    if ($denoise.Checked) { $arguments += "--denoise" }
     if (-not $stripMetadata.Checked) { $arguments += "--keep-metadata" }
     foreach ($file in $fileList.Items) { $arguments += Quote-Argument ([string]$file) }
 
