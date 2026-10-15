@@ -23,3 +23,7 @@ __pycache__/
 # OS/エディタ
 Thumbs.db
 desktop.ini
+
+# Rust (native engine)
+/native/dpo/target/
+/native/dpo/.cargo/config.toml
