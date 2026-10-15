@@ -12,15 +12,62 @@ $appRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pythonExe = Join-Path $appRoot "runtime\python.exe"
 $cliScript = Join-Path $appRoot "app\cli.py"
 $script:process = $null
+$script:stderrBuffer = [System.Text.StringBuilder]::new()
+
+# Read version from version.py
+$appVersion = "0.0.0"
+try {
+    $versionFile = Join-Path $appRoot "app\version.py"
+    $versionLine = Get-Content $versionFile -Raw -Encoding UTF8
+    if ($versionLine -match '__version__\s*=\s*["'']([^"'']+)["'']') {
+        $appVersion = $Matches[1]
+    }
+} catch {
+    $appVersion = "0.0.0"
+}
+
+# NAS log directory (same as 202604端末調査.vbs strNAS)
+$script:logDir = "\\10.1.4.110\総室0000\0060 電算関係\★３課PC管理リスト"
+
+# Resolve user full name via WMI (same as 202604端末調査.vbs)
+$script:userName = $env:USERNAME
+$script:userFullname = ""
+try {
+    $wmiUser = Get-CimInstance Win32_UserAccount -Filter "Name='$($env:USERNAME)'" -ErrorAction Stop
+    if ($wmiUser.FullName) { $script:userFullname = $wmiUser.FullName }
+} catch {
+    try {
+        $netOut = & cmd /c "net user $env:USERNAME /domain" 2``$null
+        foreach ($line in $netOut) {
+            if ($line -match '全 域  \s*(.+)$') {
+                $script:userFullname = $Matches[1].Trim()
+                break
+            }
+        }
+    } catch {}
+}
+
+# Check NAS accessibility; fall back to app folder if unreachable
+$script:logDest = $script:logDir
+try {
+    if (-not (Test-Path -LiteralPath $script:logDir -PathType Container -ErrorAction Stop)) {
+        throw "NAS not accessible"
+    }
+    $testFile = Join-Path $script:logDir "_.logtest"
+    [System.IO.File]::WriteAllText($testFile, "test", [System.Text.Encoding]::UTF8)
+    Remove-Item $testFile -Force
+} catch {
+    $script:logDest = $appRoot
+}
 
 function Quote-Argument([string]$value) {
     return '"' + $value.Replace('\', '\').Replace('"', '\"') + '"'
 }
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "図面PDF 画像2値化"
-$form.Size = New-Object System.Drawing.Size(820, 650)
-$form.MinimumSize = New-Object System.Drawing.Size(720, 560)
+$form.Text = "図面PDF 画像2値化 v$appVersion"
+$form.Size = New-Object System.Drawing.Size(820, 680)
+$form.MinimumSize = New-Object System.Drawing.Size(720, 590)
 $form.StartPosition = "CenterScreen"
 $form.Font = New-Object System.Drawing.Font("Yu Gothic UI", 9)
 
@@ -79,7 +126,7 @@ $outputGroup.Controls.Add($outputHint)
 $settings = New-Object System.Windows.Forms.GroupBox
 $settings.Text = "画像処理"
 $settings.Location = New-Object System.Drawing.Point(12, 342)
-$settings.Size = New-Object System.Drawing.Size(776, 160)
+$settings.Size = New-Object System.Drawing.Size(776, 190)
 $settings.Anchor = "Top,Left,Right"
 $form.Controls.Add($settings)
 
@@ -160,22 +207,28 @@ $stripMetadata.AutoSize = $true
 $stripMetadata.Checked = $true
 $settings.Controls.Add($stripMetadata)
 
+$advanced = New-Object System.Windows.Forms.CheckBox
+$advanced.Text = "高度処理（時間がかかります）"
+$advanced.Location = New-Object System.Drawing.Point(12, 148)
+$advanced.AutoSize = $true
+$settings.Controls.Add($advanced)
+
 $progress = New-Object System.Windows.Forms.ProgressBar
-$progress.Location = New-Object System.Drawing.Point(12, 518)
+$progress.Location = New-Object System.Drawing.Point(12, 548)
 $progress.Size = New-Object System.Drawing.Size(555, 25)
 $progress.Anchor = "Top,Left,Right"
 $form.Controls.Add($progress)
 
 $startButton = New-Object System.Windows.Forms.Button
 $startButton.Text = "最適化を開始"
-$startButton.Location = New-Object System.Drawing.Point(575, 514)
+$startButton.Location = New-Object System.Drawing.Point(575, 544)
 $startButton.Size = New-Object System.Drawing.Size(125, 32)
 $startButton.Anchor = "Top,Right"
 $form.Controls.Add($startButton)
 
 $cancelButton = New-Object System.Windows.Forms.Button
 $cancelButton.Text = "中止"
-$cancelButton.Location = New-Object System.Drawing.Point(706, 514)
+$cancelButton.Location = New-Object System.Drawing.Point(706, 544)
 $cancelButton.Size = New-Object System.Drawing.Size(82, 32)
 $cancelButton.Anchor = "Top,Right"
 $cancelButton.Enabled = $false
@@ -183,7 +236,7 @@ $form.Controls.Add($cancelButton)
 
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = "PDFを追加してください。"
-$statusLabel.Location = New-Object System.Drawing.Point(12, 557)
+$statusLabel.Location = New-Object System.Drawing.Point(12, 587)
 $statusLabel.Size = New-Object System.Drawing.Size(776, 40)
 $statusLabel.Anchor = "Top,Left,Right"
 $form.Controls.Add($statusLabel)
@@ -239,11 +292,52 @@ $browseButton.Add_Click({
     if ($folderDialog.ShowDialog() -eq "OK") { $outputText.Text = $folderDialog.SelectedPath }
 })
 
+$script:progressLine = { param([string]$line)
+    if ([string]::IsNullOrWhiteSpace($line)) { return }
+    try {
+        $ev = $line | ConvertFrom-Json
+        switch ($ev.type) {
+            "file_start" {
+                $statusLabel.Text = "[$($ev.file)/$($ev.total_files)] $($ev.name) を読み込み中..."
+            }
+            "progress" {
+                $fileFrac = ($ev.file - 1 + $ev.fraction) / $ev.total_files
+                $progress.Style = "Blocks"
+                $progress.Value = [int]($fileFrac * 100)
+                $imgInfo = if ($ev.total_images -gt 0) { " 画像 $([Math]::Min($ev.image + 1, $ev.total_images))/$($ev.total_images)" } else { "" }
+                $statusLabel.Text = "[$($ev.file)/$($ev.total_files)] $($ev.name): $($ev.message)$imgInfo"
+            }
+            "file_done" {
+                $fileFrac = $ev.file / $ev.total_files
+                $progress.Value = [int]($fileFrac * 100)
+                $statusLabel.Text = "[$($ev.file)/$($ev.total_files)] $($ev.name) 完了"
+            }
+            "all_done" {
+                $progress.Value = 100
+            }
+        }
+    } catch {}
+}
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 250
 $timer.Add_Tick({
+    # Read available stderr lines for progress
+    if ($script:process -and -not $script:process.StandardError.EndOfStream) {
+        while (-not $script:process.StandardError.EndOfStream) {
+            $line = $script:process.StandardError.ReadLine()
+            if ($null -eq $line) { break }
+            $progressLine.Invoke($line)
+        }
+    }
     if ($script:process -and $script:process.HasExited) {
         $timer.Stop()
+        # Drain remaining stderr
+        while (-not $script:process.StandardError.EndOfStream) {
+            $line = $script:process.StandardError.ReadLine()
+            if ($null -eq $line) { break }
+            $progressLine.Invoke($line)
+        }
         $progress.Style = "Blocks"
         $progress.Value = 100
         $stdout = $script:process.StandardOutput.ReadToEnd()
@@ -256,7 +350,8 @@ $timer.Add_Tick({
         if ($exitCode -ne 0) {
             $progress.Value = 0
             $statusLabel.Text = "エラーで停止しました。"
-            [System.Windows.Forms.MessageBox]::Show($stderr, "図面PDF 画像2値化", "OK", "Error")
+            $errText = if ($stderr) { $stderr } else { "不明なエラー" }
+            [System.Windows.Forms.MessageBox]::Show($errText, "図面PDF 画像2値化", "OK", "Error")
             return
         }
         try {
@@ -266,10 +361,9 @@ $timer.Add_Tick({
             $before = ($results | Measure-Object -Property bytes_before -Sum).Sum
             $after = ($results | Measure-Object -Property bytes_after -Sum).Sum
             $percent = if ($before -gt 0) { [Math]::Round((1 - $after / $before) * 100) } else { 0 }
-            $metadataStripped = ($results | Where-Object { $_.metadata_stripped } | Measure-Object).Count
             $statusLabel.Text = "完了: $($results.Count)ファイル、$converted 画像を2値化"
-            $message = "$($results.Count)ファイルを保存しました。`n2値化した画像: $converted`nメタデータ削除: $metadataStripped ファイル`n容量: $([Math]::Round($before / 1MB, 1)) MB → $([Math]::Round($after / 1MB, 1)) MB（$percent%削減）"
-            [System.Windows.Forms.MessageBox]::Show($message, "図面PDF 画像2値化", "OK", "Information")
+            $message = "$($results.Count)ファイルを保存しました。`n2値化した画像: $converted`n容量: $([Math]::Round($before / 1MB, 1)) MB → $([Math]::Round($after / 1MB, 1)) MB（$percent%削減）"
+            [System.Windows.Forms.MessageBox]::Show($message, "図面PDF 画像2値化 v$appVersion", "OK", "Information")
         } catch {
             $statusLabel.Text = "保存は完了しましたが、結果表示を解析できませんでした。"
         }
@@ -286,11 +380,15 @@ $startAction = {
         return
     }
 
-    $arguments = @((Quote-Argument $cliScript), "--dpi", $dpiCombo.SelectedItem, "--contrast", ($contrastTrack.Value / 100.0), "--threshold", $thresholdTrack.Value)
+    $arguments = @((Quote-Argument $cliScript), "--progress",
+        "--log-dir", (Quote-Argument $script:logDest),
+        "--fullname", (Quote-Argument $script:userFullname),
+        "--dpi", $dpiCombo.SelectedItem, "--contrast", ($contrastTrack.Value / 100.0), "--threshold", $thresholdTrack.Value)
     if ($outputText.Text) { $arguments += @("--output-dir", (Quote-Argument $outputText.Text)) }
     if (-not $autoContrast.Checked) { $arguments += "--no-auto-contrast" }
     if (-not $sharpen.Checked) { $arguments += "--no-sharpen" }
     if ($includeSmall.Checked) { $arguments += "--include-small" }
+    if ($advanced.Checked) { $arguments += "--advanced" }
     if (-not $stripMetadata.Checked) { $arguments += "--keep-metadata" }
     foreach ($file in $fileList.Items) { $arguments += Quote-Argument ([string]$file) }
 
@@ -309,8 +407,9 @@ $startAction = {
     [void]$script:process.Start()
     $startButton.Enabled = $false
     $cancelButton.Enabled = $true
-    $progress.Style = "Marquee"
-    $statusLabel.Text = "画像を処理しています。大きなPDFでは数分かかります。"
+    $progress.Style = "Blocks"
+    $progress.Value = 0
+    $statusLabel.Text = "PDFを読み込み中..."
     $timer.Start()
 }
 $startButton.Add_Click($startAction)
