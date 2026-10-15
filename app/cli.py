@@ -78,7 +78,6 @@ def main() -> int:
     parser.add_argument("--no-auto-contrast", action="store_true")
     parser.add_argument("--no-sharpen", action="store_true")
     parser.add_argument("--denoise", action="store_true")
-    parser.add_argument("--advanced", action="store_true", help="縮小判定による高度処理")
     parser.add_argument("--include-small", action="store_true")
     parser.add_argument("--keep-metadata", action="store_true")
     parser.add_argument(
@@ -101,7 +100,6 @@ def main() -> int:
         contrast=max(1.0, min(1.5, args.contrast)),
         sharpen=not args.no_sharpen,
         denoise=args.denoise,
-        advanced_processing=args.advanced,
         threshold_offset=max(-30, min(30, args.threshold)),
         include_small_images=args.include_small,
         strip_metadata=not args.keep_metadata,

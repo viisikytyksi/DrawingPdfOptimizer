@@ -32,7 +32,7 @@ class OptimizerApp(tk.Tk):
         self.sharpen_var = tk.BooleanVar(value=True)
         self.threshold_var = tk.IntVar(value=0)
         self.include_small_var = tk.BooleanVar(value=False)
-        self.advanced_var = tk.BooleanVar(value=False)
+        self.denoise_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="PDFを追加してください。")
 
         self._build_ui()
@@ -107,8 +107,8 @@ class OptimizerApp(tk.Tk):
         ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
         ttk.Checkbutton(
             settings,
-            text="高度処理（時間がかかります）",
-            variable=self.advanced_var,
+            text="ノイズ除去（薄いスキャン向け・時間約1.5倍）",
+            variable=self.denoise_var,
         ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         run_area = ttk.Frame(root)
@@ -168,7 +168,7 @@ class OptimizerApp(tk.Tk):
             sharpen=self.sharpen_var.get(),
             threshold_offset=round(float(self.threshold_var.get())),
             include_small_images=self.include_small_var.get(),
-            advanced_processing=self.advanced_var.get(),
+            denoise=self.denoise_var.get(),
         )
         self._cancel.clear()
         self.start_button.configure(state="disabled")

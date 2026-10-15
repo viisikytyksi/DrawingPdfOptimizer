@@ -72,7 +72,6 @@ class OptimizeOptions:
     contrast: float = 1.15
     sharpen: bool = True
     denoise: bool = False
-    advanced_processing: bool = False
     threshold_offset: int = 0
     include_small_images: bool = False
     strip_metadata: bool = True
@@ -181,18 +180,9 @@ def _prepare_image(image: Image.Image, options: OptimizeOptions) -> tuple[Image.
     # only if mixed-scale drawings still show measurable background loss.
     background = gray.filter(ImageFilter.GaussianBlur(radius=25))
     gray = ImageChops.subtract(gray, background, offset=128)
-    if options.advanced_processing:
-        red = working.getchannel("R")
-        blue = working.getchannel("B")
-        blue_score = ImageChops.subtract(blue, red, offset=128)
-        blue_mask = blue_score.point(lambda value: 255 if value >= 145 else 0)
-        blue_mask = blue_mask.filter(ImageFilter.MedianFilter(size=3))
-        gray = ImageChops.subtract(gray, blue_mask.point(lambda value: 10 if value else 0))
 
     if options.auto_contrast:
         gray = ImageOps.autocontrast(gray, cutoff=0.5)
-    if options.denoise:
-        gray = gray.filter(ImageFilter.MedianFilter(size=3))
     if options.contrast != 1.0:
         gray = ImageEnhance.Contrast(gray).enhance(options.contrast)
     if options.sharpen:
@@ -206,23 +196,51 @@ def _prepare_image(image: Image.Image, options: OptimizeOptions) -> tuple[Image.
     histogram = binary.histogram()
     if histogram[0] > histogram[255]:
         binary = ImageOps.invert(binary.convert("L")).convert("1")
+    if options.denoise:
+        binary = _despeckle(binary)
     return binary, threshold
 
 
-def _advanced_profile(image: Image.Image) -> tuple[bool, float]:
-    """Return (needs_denoise, ambiguity_score) from a small preview."""
-    image.load()
-    preview = image.convert("RGB").getchannel("R")
-    preview.thumbnail((512, 512), Image.Resampling.BILINEAR)
-    background = preview.filter(ImageFilter.GaussianBlur(radius=5))
-    preview = ImageChops.subtract(preview, background, offset=128)
-    preview = ImageOps.autocontrast(preview, cutoff=0.5)
-    threshold = _otsu_threshold(preview)
-    histogram = preview.histogram()
-    total = preview.width * preview.height
-    black_ratio = sum(histogram[: threshold + 1]) / max(total, 1)
-    ambiguity = sum(histogram[max(0, threshold - 10) : min(256, threshold + 11)]) / max(total, 1)
-    return black_ratio >= 0.20 or ambiguity >= 0.12, ambiguity
+def _despeckle(binary: Image.Image, min_neighbours: int = 2) -> Image.Image:
+    """Drop black pixels with fewer than min_neighbours black neighbours (8-connected).
+
+    Removes scan grain from the 1bit result instead of smoothing the grayscale,
+    which keeps thin lines intact: a 1px line has two neighbours along its run, so
+    it survives, while isolated dots and 2px specks do not. Runs at native
+    resolution with shifted copies, so it costs a fraction of a 3x3 median filter.
+    """
+    width, height = binary.size
+    white = Image.new("1", (width, height), 1)
+    black = ImageChops.logical_xor(binary, white)  # 1 where the pixel is black
+    counts: Image.Image | None = None
+    if min_neighbours <= 1:
+        neighbours: Image.Image | None = None
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                shifted = Image.new("1", (width, height), 0)
+                shifted.paste(black, (dx, dy))
+                neighbours = (
+                    shifted if neighbours is None else ImageChops.logical_or(neighbours, shifted)
+                )
+        keep = ImageChops.logical_and(black, neighbours)
+    else:
+        ones = black.convert("L").point(lambda value: 1 if value else 0)
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                shifted = Image.new("L", (width, height), 0)
+                shifted.paste(ones, (dx, dy))
+                counts = shifted if counts is None else ImageChops.add(counts, shifted)
+        enough = counts.point(lambda value: 255 if value >= min_neighbours else 0).convert("1")
+        keep = ImageChops.logical_and(black, enough)
+    result = ImageChops.logical_xor(keep, white)
+    if min_neighbours > 1:
+        # Dropping a 2px speck leaves its partner without neighbours.
+        result = _despeckle(result, 1)
+    return result
 
 
 def _encode_ccitt_g4(image: Image.Image) -> bytes | None:
@@ -404,9 +422,7 @@ def _decode_job_image(
     return image_file.image, target, reference
 
 
-def _process_image_job(
-    job: ImageJob, options: OptimizeOptions, page_profiles: dict[int, bool]
-) -> ImageOutcome:
+def _process_image_job(job: ImageJob, options: OptimizeOptions) -> ImageOutcome:
     """Decode, prepare and encode one image; runs inside a worker thread."""
     image, target, reference = _decode_job_image(job)
     if image is None:
@@ -426,15 +442,7 @@ def _process_image_job(
     max_width, max_height = _a3_pixel_box(image, options.dpi)
     if image.mode == "1" and bits == 1 and width <= max_width and height <= max_height:
         return ImageOutcome(skip="already", reference=reference)
-    image_options = options
-    if options.advanced_processing:
-        noisy_page = page_profiles.get(job.page_number, False)
-        image_options = replace(
-            options,
-            denoise=options.denoise or noisy_page,
-            threshold_offset=options.threshold_offset + (-10 if noisy_page else 0),
-        )
-    binary, _ = _prepare_image(image, image_options)
+    binary, _ = _prepare_image(image, options)
     stream = _encode_ccitt_g4(binary)
     if stream is None:
         # No CCITT encoder available: the caller falls back to replace(), which
@@ -443,22 +451,6 @@ def _process_image_job(
     return ImageOutcome(
         reference=reference, stream=stream, stream_object=target, size=binary.size
     )
-
-
-def _profile_image_job(job: ImageJob) -> bool:
-    """Return whether one image looks like a noisy scan; runs in a worker thread."""
-    image, _, _ = _decode_job_image(job)
-    if image is None:
-        raise ValueError("画像を復号できません")
-    return _advanced_profile(image)[0]
-
-
-def _profile_image_job(job: ImageJob) -> bool:
-    """Return whether one image looks like a noisy scan; runs in a worker thread."""
-    image, _, _ = _decode_job_image(job)
-    if image is None:
-        raise ValueError("画像を復号できません")
-    return _advanced_profile(image)[0]
 
 
 def _strip_pdf_metadata(writer: PdfWriter) -> bool:
@@ -531,39 +523,14 @@ def optimize_pdf(
 
         jobs = _collect_images(writer, result)
         result.total_images = len(jobs)
-        page_profiles: dict[int, bool] = {}
         conversion_errors: list[str] = []
         # Decoding and encoding are Pillow C work that releases the GIL, so the
         # whole convert step runs in the pool; pypdf writer mutation stays here.
         worker_count = min(8, max(2, (os.cpu_count() or 4) // 2), len(jobs)) or 1
 
-        if options.advanced_processing:
-            page_scores: dict[int, list[bool]] = {}
-            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
-                futures = [pool.submit(_profile_image_job, job) for job in jobs]
-                for job, future in zip(jobs, futures):
-                    try:
-                        needs_denoise = future.result()
-                    except (
-                        OSError,
-                        ValueError,
-                        TypeError,
-                        MemoryError,
-                        LimitReachedError,
-                        PdfReadError,
-                    ):
-                        continue
-                    page_scores.setdefault(job.page_number, []).append(needs_denoise)
-            page_profiles = {
-                page_number: sum(scores) > len(scores) / 2
-                for page_number, scores in page_scores.items()
-            }
-
         written: set[tuple[int, int]] = set()
         with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
-            futures = [
-                pool.submit(_process_image_job, job, options, page_profiles) for job in jobs
-            ]
+            futures = [pool.submit(_process_image_job, job, options) for job in jobs]
             for index, (job, future) in enumerate(zip(jobs, futures), start=1):
                 if cancel_event is not None and cancel_event.is_set():
                     raise CancelledError("処理を中止しました。")

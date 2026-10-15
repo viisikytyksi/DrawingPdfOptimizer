@@ -211,15 +211,9 @@ $stripMetadata.AutoSize = $true
 $stripMetadata.Checked = $true
 $settings.Controls.Add($stripMetadata)
 
-$advanced = New-Object System.Windows.Forms.CheckBox
-$advanced.Text = "高度処理（時間がかかります）"
-$advanced.Location = New-Object System.Drawing.Point(12, 148)
-$advanced.AutoSize = $true
-$settings.Controls.Add($advanced)
-
 $denoise = New-Object System.Windows.Forms.CheckBox
-$denoise.Text = "ノイズ除去（薄いスキャン向け・時間約2倍）"
-$denoise.Location = New-Object System.Drawing.Point(350, 148)
+$denoise.Text = "ノイズ除去（薄いスキャン向け・時間約1.5倍）"
+$denoise.Location = New-Object System.Drawing.Point(12, 148)
 $denoise.AutoSize = $true
 $denoise.Checked = $true
 $settings.Controls.Add($denoise)
@@ -419,7 +413,6 @@ $startAction = {
     if (-not $autoContrast.Checked) { $arguments += "--no-auto-contrast" }
     if (-not $sharpen.Checked) { $arguments += "--no-sharpen" }
     if ($includeSmall.Checked) { $arguments += "--include-small" }
-    if ($advanced.Checked) { $arguments += "--advanced" }
     if ($denoise.Checked) { $arguments += "--denoise" }
     if (-not $stripMetadata.Checked) { $arguments += "--keep-metadata" }
     foreach ($file in $fileList.Items) { $arguments += Quote-Argument ([string]$file) }
