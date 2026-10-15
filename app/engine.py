@@ -18,6 +18,10 @@ try:  # pypdf >= 6.20 reads its limits from Configuration
     from pypdf import overwrite_configuration as _overwrite_configuration
 except ImportError:  # pragma: no cover - older pypdf reads the module constants
     _overwrite_configuration = None
+try:  # private helper: decoding one image XObject ourselves
+    from pypdf.generic._image_xobject import _xobj_to_image
+except ImportError:  # pragma: no cover - fall back to pypdf's page.images accessor
+    _xobj_to_image = None
 from pypdf.generic import (
     ArrayObject,
     BooleanObject,
@@ -90,6 +94,29 @@ class OptimizeResult:
     bytes_after: int = 0
     metadata_stripped: bool = False
     warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ImageJob:
+    """One image to convert. Decoding happens in the worker pool, not here."""
+
+    page_number: int
+    page: object
+    key: object
+    stream_object: object | None
+    reference: tuple[int, int] | None
+
+
+@dataclass(frozen=True)
+class ImageOutcome:
+    """What a worker decided for one image."""
+
+    skip: str = ""  # "" | "small" | "already" | "inline"
+    reference: tuple[int, int] | None = None
+    stream: bytes | None = None  # encoded CCITT G4
+    stream_object: object | None = None  # XObject to write the stream into
+    binary: Image.Image | None = None  # prepared image when encoding is unavailable
+    size: tuple[int, int] = (0, 0)
 
 
 class CancelledError(RuntimeError):
@@ -198,10 +225,6 @@ def _advanced_profile(image: Image.Image) -> tuple[bool, float]:
     return black_ratio >= 0.20 or ambiguity >= 0.12, ambiguity
 
 
-def _prepare_image_task(image: Image.Image, options: OptimizeOptions) -> tuple[Image.Image, int]:
-    return _prepare_image(image, options)
-
-
 def _encode_ccitt_g4(image: Image.Image) -> bytes | None:
     """Return a CCITT Group 4 stream for a 1bit image, or None when unavailable.
 
@@ -242,27 +265,17 @@ def _encode_ccitt_g4(image: Image.Image) -> bytes | None:
     return strip or None
 
 
-def _replace_with_ccitt(image_file: object, binary: Image.Image) -> bool:
-    """Write the prepared 1bit image into its existing XObject as CCITT G4.
+def _write_ccitt_stream(stream_object: object, stream: bytes, size: tuple[int, int]) -> bool:
+    """Write a prepared 1bit image into its existing XObject as CCITT G4.
 
     pypdf's ImageFile.replace() round-trips the image through a temporary PDF
     (Pillow write, parse, decode, re-encode). Writing the stream in place keeps
-    the same bytes with a single encode. Returns False when the fast path is not
-    usable, so the caller can fall back to replace().
+    the same bytes with a single encode. Returns False when the object is not an
+    image stream, so the caller can fall back to replace().
     """
-    reference = getattr(image_file, "indirect_reference", None)
-    if reference is None:
-        return False
-    stream = _encode_ccitt_g4(binary)
-    if stream is None:
-        return False
-    try:
-        stream_object = reference.get_object()
-    except (OSError, ValueError, TypeError):
-        return False
     if not isinstance(stream_object, StreamObject) or stream_object.get("/Subtype") != "/Image":
         return False
-    width, height = binary.size
+    width, height = size
     # pypdf compresses Flate through set_data(); assign the encoded bytes directly.
     stream_object._data = stream
     stream_object[NameObject("/Type")] = NameObject("/XObject")
@@ -289,8 +302,6 @@ def _replace_with_ccitt(image_file: object, binary: Image.Image) -> bool:
     for key in ("/SMask", "/Mask", "/Decode", "/Interpolate", "/Intent"):
         if key in stream_object:
             del stream_object[NameObject(key)]
-    image_file.image = binary
-    image_file.data = stream
     return True
 
 
@@ -301,8 +312,56 @@ def _image_key(image_file: object) -> tuple[int, int] | None:
     return int(reference.idnum), int(reference.generation)
 
 
-def _collect_images(writer: PdfWriter, result: OptimizeResult) -> list[tuple[int, object]]:
-    images: list[tuple[int, object]] = []
+def _resolve_image_object(page: object, key: object) -> tuple[object, tuple[int, int]] | None:
+    """Resolve a pypdf image key to (image stream object, (idnum, generation)).
+
+    Returns None for inline images and for direct (non-indirect) image objects,
+    which pypdf reports without an indirect reference and this tool skips, as well
+    as for any key shape this walk does not understand — those keep pypdf's own
+    path so nothing is dropped without its usual accounting.
+    """
+    names = list(key) if isinstance(key, (list, tuple)) else [key]
+    if not names or not all(isinstance(name, str) for name in names):
+        return None
+    if names[0].startswith("~") and names[0].endswith("~"):
+        return None  # inline image
+    container: object = page
+    for position, name in enumerate(names):
+        if not hasattr(container, "get"):
+            return None
+        resources = container.get("/Resources")
+        if resources is None:
+            return None
+        if hasattr(resources, "get_object"):
+            resources = resources.get_object()
+        xobjects = resources.get("/XObject") if hasattr(resources, "get") else None
+        if xobjects is None:
+            return None
+        if hasattr(xobjects, "get_object"):
+            xobjects = xobjects.get_object()
+        if not hasattr(xobjects, "get") or name not in xobjects:
+            return None
+        # .get() keeps the IndirectObject; __getitem__ would resolve it away.
+        entry = xobjects.get(name)
+        if entry is None:
+            return None
+        target = entry.get_object() if hasattr(entry, "get_object") else entry
+        if position + 1 == len(names):
+            idnum = getattr(entry, "idnum", None)
+            if idnum is None:
+                return None  # direct object: pypdf reports no indirect reference
+            return target, (int(idnum), int(getattr(entry, "generation", 0)))
+        container = target
+    return None
+
+
+def _collect_images(writer: PdfWriter, result: OptimizeResult) -> list[ImageJob]:
+    """List the images to convert without decoding them.
+
+    Decoding is the expensive part of a large drawing, so it happens later in the
+    worker pool; this walk only reads the object graph.
+    """
+    jobs: list[ImageJob] = []
     seen: set[tuple[int, int]] = set()
     for page_number, page in enumerate(writer.pages, start=1):
         try:
@@ -312,24 +371,94 @@ def _collect_images(writer: PdfWriter, result: OptimizeResult) -> list[tuple[int
                 f"{page_number}ページの画像一覧を取得できないため、処理を中止しました: {exc}"
             ) from exc
         for key in keys:
-            try:
-                image_file = page.images[key]
-                object_key = _image_key(image_file)
-                if object_key is None:
-                    result.skipped_inline += 1
-                    continue
-                if object_key in seen:
-                    continue
-                seen.add(object_key)
-                images.append((page_number, image_file))
-            except Exception as exc:
-                raise RuntimeError(
-                    f"{page_number}ページの画像 {key} を読み込めないため、"
-                    f"混在を防ぐため処理を中止しました: {exc}"
-                ) from exc
-    return images
+            resolved = _resolve_image_object(page, key) if _xobj_to_image is not None else None
+            if resolved is None:
+                jobs.append(ImageJob(page_number, page, key, None, None))
+                continue
+            stream_object, reference = resolved
+            if reference in seen:
+                continue
+            seen.add(reference)
+            jobs.append(ImageJob(page_number, page, key, stream_object, reference))
+    return jobs
 
 
+
+
+def _decode_job_image(
+    job: ImageJob,
+) -> tuple[Image.Image | None, object | None, tuple[int, int] | None]:
+    """Decode one image and locate the XObject it belongs to; runs in a worker.
+
+    Images resolved during collection are decoded straight from their stream object.
+    Anything else goes through pypdf's own image accessor, which also covers inline
+    images and keys this walk does not understand.
+    """
+    if job.stream_object is not None:
+        return _xobj_to_image(job.stream_object)[2], job.stream_object, job.reference
+    image_file = job.page._get_image(job.key)
+    reference = _image_key(image_file)
+    target = None
+    if image_file.indirect_reference is not None:
+        target = image_file.indirect_reference.get_object()
+    return image_file.image, target, reference
+
+
+def _process_image_job(
+    job: ImageJob, options: OptimizeOptions, page_profiles: dict[int, bool]
+) -> ImageOutcome:
+    """Decode, prepare and encode one image; runs inside a worker thread."""
+    image, target, reference = _decode_job_image(job)
+    if image is None:
+        raise ValueError("画像を復号できません")
+    if reference is None:
+        return ImageOutcome(skip="inline")
+    width, height = image.size
+    bits = int(getattr(image, "bits", 8))
+    # Treat tiled drawing backgrounds as processable raster images.
+    # Many CAD/PDF exports split one scanned sheet into 1024x1024 JPEG tiles;
+    # those tiles are smaller than min_long_side but still large enough by pixel count.
+    # Skip only images that are small by both dimensions and area.
+    if not options.include_small_images and (
+        max(width, height) < options.min_long_side and width * height < options.min_pixels
+    ):
+        return ImageOutcome(skip="small", reference=reference)
+    max_width, max_height = _a3_pixel_box(image, options.dpi)
+    if image.mode == "1" and bits == 1 and width <= max_width and height <= max_height:
+        return ImageOutcome(skip="already", reference=reference)
+    image_options = options
+    if options.advanced_processing:
+        noisy_page = page_profiles.get(job.page_number, False)
+        image_options = replace(
+            options,
+            denoise=options.denoise or noisy_page,
+            threshold_offset=options.threshold_offset + (-10 if noisy_page else 0),
+        )
+    binary, _ = _prepare_image(image, image_options)
+    stream = _encode_ccitt_g4(binary)
+    if stream is None:
+        # No CCITT encoder available: the caller falls back to replace(), which
+        # asks pypdf for the image again rather than keeping decoded pixels here.
+        return ImageOutcome(reference=reference, binary=binary, size=binary.size)
+    return ImageOutcome(
+        reference=reference, stream=stream, stream_object=target, size=binary.size
+    )
+
+
+def _profile_image_job(job: ImageJob) -> bool:
+    """Return whether one image looks like a noisy scan; runs in a worker thread."""
+    image, _, _ = _decode_job_image(job)
+    if image is None:
+        raise ValueError("画像を復号できません")
+    return _advanced_profile(image)[0]
+
+
+def _profile_image_job(job: ImageJob) -> bool:
+    """Return whether one image looks like a noisy scan; runs in a worker thread."""
+    image, _, _ = _decode_job_image(job)
+    if image is None:
+        raise ValueError("画像を復号できません")
+    return _advanced_profile(image)[0]
 
 
 def _strip_pdf_metadata(writer: PdfWriter) -> bool:
@@ -400,95 +529,81 @@ def optimize_pdf(
         if options.strip_metadata:
             result.metadata_stripped = _strip_pdf_metadata(writer)
 
-        images = _collect_images(writer, result)
-        result.total_images = len(images) + result.skipped_inline
+        jobs = _collect_images(writer, result)
+        result.total_images = len(jobs)
         page_profiles: dict[int, bool] = {}
+        conversion_errors: list[str] = []
+        # Decoding and encoding are Pillow C work that releases the GIL, so the
+        # whole convert step runs in the pool; pypdf writer mutation stays here.
+        worker_count = min(8, max(2, (os.cpu_count() or 4) // 2), len(jobs)) or 1
+
         if options.advanced_processing:
             page_scores: dict[int, list[bool]] = {}
-            for page_number, image_file in images:
-                image = image_file.image
-                if image is not None:
-                    needs_denoise, _ = _advanced_profile(image)
-                    page_scores.setdefault(page_number, []).append(needs_denoise)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
+                futures = [pool.submit(_profile_image_job, job) for job in jobs]
+                for job, future in zip(jobs, futures):
+                    try:
+                        needs_denoise = future.result()
+                    except (
+                        OSError,
+                        ValueError,
+                        TypeError,
+                        MemoryError,
+                        LimitReachedError,
+                        PdfReadError,
+                    ):
+                        continue
+                    page_scores.setdefault(job.page_number, []).append(needs_denoise)
             page_profiles = {
                 page_number: sum(scores) > len(scores) / 2
                 for page_number, scores in page_scores.items()
             }
-        conversion_errors: list[str] = []
-        work_items: list[tuple[int, object, Image.Image, OptimizeOptions]] = []
 
-        for index, (page_number, image_file) in enumerate(images, start=1):
-            if cancel_event is not None and cancel_event.is_set():
-                raise CancelledError("処理を中止しました。")
-            try:
-                image = image_file.image
-                if image is None:
-                    raise ValueError("画像を復号できません")
-                width, height = image.size
-                bits = int(getattr(image, "bits", 8))
-                # Treat tiled drawing backgrounds as processable raster images.
-                # Many CAD/PDF exports split one scanned sheet into 1024x1024 JPEG tiles;
-                # those tiles are smaller than min_long_side but still large enough by pixel count.
-                # Skip only images that are small by both dimensions and area.
-                if not options.include_small_images and (
-                    max(width, height) < options.min_long_side
-                    and width * height < options.min_pixels
-                ):
-                    result.skipped_small += 1
-                    continue
-
-                max_w, max_h = _a3_pixel_box(image, options.dpi)
-                if image.mode == "1" and bits == 1 and width <= max_w and height <= max_h:
-                    continue
-
-                image_options = options
-                if options.advanced_processing:
-                    noisy_page = page_profiles.get(page_number, False)
-                    image_options = replace(
-                        options,
-                        denoise=options.denoise or noisy_page,
-                        threshold_offset=options.threshold_offset + (-10 if noisy_page else 0),
-                    )
-                work_items.append((index, image_file, image, image_options))
-            except (
-                OSError,
-                ValueError,
-                TypeError,
-                MemoryError,
-                LimitReachedError,
-                PdfReadError,
-            ) as exc:
-                result.skipped_unsupported += 1
-                message = (
-                    f"画像 {index} ({getattr(image_file, 'name', '?')}): "
-                    f"{type(exc).__name__} - {exc}"
-                )
-                result.warnings.append(message)
-                conversion_errors.append(message)
-
-        # PIL processing releases the GIL in its expensive C operations. Keep
-        # pypdf writer mutation below serialized to avoid corrupting its object graph.
-        worker_count = min(8, max(2, (os.cpu_count() or 4) // 2), len(work_items))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count or 1) as pool:
+        written: set[tuple[int, int]] = set()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as pool:
             futures = [
-                pool.submit(_prepare_image_task, image, image_options)
-                for _, _, image, image_options in work_items
+                pool.submit(_process_image_job, job, options, page_profiles) for job in jobs
             ]
-            for (index, image_file, _, _), future in zip(work_items, futures):
+            for index, (job, future) in enumerate(zip(jobs, futures), start=1):
                 if cancel_event is not None and cancel_event.is_set():
                     raise CancelledError("処理を中止しました。")
                 if progress:
-                    progress(f"画像 {index}/{len(images)} を処理中", index - 1, len(images))
+                    progress(f"画像 {index}/{len(jobs)} を処理中", index - 1, len(jobs))
                 try:
-                    binary, _ = future.result()
-                    if not _replace_with_ccitt(image_file, binary):
-                        image_file.replace(binary)
-                    if image_file.image is None or image_file.image.mode != "1":
-                        raise ValueError("2値画像への差し替え結果を検証できません")
-                    if image_file.image.size != binary.size:
-                        raise ValueError(
-                            f"差し替え後の寸法が不一致です ({image_file.image.size} != {binary.size})"
-                        )
+                    outcome = future.result()
+                except (
+                    OSError,
+                    ValueError,
+                    TypeError,
+                    MemoryError,
+                    LimitReachedError,
+                    PdfReadError,
+                ) as exc:
+                    result.skipped_unsupported += 1
+                    message = f"画像 {index} ({job.key}): {type(exc).__name__} - {exc}"
+                    result.warnings.append(message)
+                    conversion_errors.append(message)
+                    continue
+                if outcome.skip == "inline":
+                    result.skipped_inline += 1
+                    continue
+                if outcome.skip == "small":
+                    result.skipped_small += 1
+                    continue
+                if outcome.skip == "already":
+                    continue
+                if outcome.reference is not None:
+                    if outcome.reference in written:
+                        continue
+                    written.add(outcome.reference)
+                try:
+                    if outcome.stream is not None:
+                        if outcome.stream_object is None or not _write_ccitt_stream(
+                            outcome.stream_object, outcome.stream, outcome.size
+                        ):
+                            raise ValueError("画像XObjectへ書き込めません")
+                    else:
+                        job.page._get_image(job.key).replace(outcome.binary)
                     result.converted_images += 1
                 except (
                     OSError,
@@ -499,10 +614,7 @@ def optimize_pdf(
                     PdfReadError,
                 ) as exc:
                     result.skipped_unsupported += 1
-                    message = (
-                        f"画像 {index} ({getattr(image_file, 'name', '?')}): "
-                        f"{type(exc).__name__} - {exc}"
-                    )
+                    message = f"画像 {index} ({job.key}): {type(exc).__name__} - {exc}"
                     result.warnings.append(message)
                     conversion_errors.append(message)
 
