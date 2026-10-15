@@ -1,0 +1,12 @@
+# 同梱ポータブルPythonランタイムの依存（バージョン固定）
+#
+# 2026-10-15時点の配布物（v0.8.0〜v0.8.2）が同梱している組み合わせ。
+# 再ビルド時は必ずこのバージョンを指定する。
+#
+#   runtime\python.exe -m pip install -r runtime-requirements.txt --target runtime\Lib\site-packages
+#
+# 理由: pypdf は 6.20 で展開上限の指定方法が変わった（filters のモジュール定数 →
+# Configuration）。上限を上げる処理は両APIに対応済みだが、pypdf 側の挙動が
+# 変わるため、配布物の実績があるバージョンに固定する。
+pypdf==6.10.0
+pillow==12.2.0

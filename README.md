@@ -90,7 +90,13 @@ python .\build_portable.py <出力フォルダー>
 
 1. python.org から **Windows embeddable package (64-bit)** を入手し、`runtime/` へ展開する
 2. `python312._pth` の `#import site` のコメントを外す
-3. get-pip.py で pip を導入し、`pypdf` と `Pillow` を `runtime/Lib/site-packages` へインストールする
+3. get-pip.py で pip を導入し、**`runtime-requirements.txt` の固定バージョン**を入れる
+
+```powershell
+runtime\python.exe -m pip install -r runtime-requirements.txt --target runtime\Lib\site-packages
+```
+
+`runtime-requirements.txt` は pypdf 6.10.0 / Pillow 12.2.0 を指定している。pypdf は 6.20 で展開上限の指定方法が変わっており、実績のあるバージョンへ固定しておく。
 
 配布時は `runtime/` を含めたフォルダ一式をzipにする。インターネットに接続できない、
 または管理者権限が無いPCでも使えるよう、インストーラを使わずフォルダのコピーだけで動く形にしている。
