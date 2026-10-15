@@ -13,6 +13,11 @@ from typing import Callable
 from PIL import Image, ImageChops, ImageEnhance, ImageFilter, ImageOps, features as pil_features
 from pypdf import PdfWriter, filters as pypdf_filters
 from pypdf.errors import LimitReachedError, PdfReadError
+
+try:  # pypdf >= 6.20 reads its limits from Configuration
+    from pypdf import overwrite_configuration as _overwrite_configuration
+except ImportError:  # pragma: no cover - older pypdf reads the module constants
+    _overwrite_configuration = None
 from pypdf.generic import (
     ArrayObject,
     BooleanObject,
@@ -26,6 +31,34 @@ from pypdf.generic import (
 
 ProgressCallback = Callable[[str, int, int], None]
 _LARGE_STREAM_LIMIT = 120_000_000
+# pypdf caps decompressed stream output to guard against hostile files. Trusted
+# local drawings exceed the 75MB default (one 5074x5166 8bit RGB Flate image is
+# 78MB), so the ceiling is raised for the run. Which knob the installed version
+# reads changed in 6.20 (module constants -> Configuration), so both are set.
+_LEGACY_LIMIT_NAMES = (
+    "ZLIB_MAX_OUTPUT_LENGTH",
+    "FLATE_MAX_BUFFER_SIZE",
+    "MAX_DECLARED_STREAM_LENGTH",
+    "MAX_ARRAY_BASED_STREAM_OUTPUT_LENGTH",
+    "LZW_MAX_OUTPUT_LENGTH",
+    "RUN_LENGTH_MAX_OUTPUT_LENGTH",
+    "JBIG2_MAX_OUTPUT_LENGTH",
+)
+
+
+def _raise_decompression_limits() -> None:
+    """Raise pypdf's decompression ceilings for trusted local drawing files."""
+    for name in _LEGACY_LIMIT_NAMES:
+        current = getattr(pypdf_filters, name, None)
+        if isinstance(current, int):
+            setattr(pypdf_filters, name, max(current, _LARGE_STREAM_LIMIT))
+    if _overwrite_configuration is not None:
+        _overwrite_configuration(
+            maximum_declared_stream_length=_LARGE_STREAM_LIMIT,
+            array_based_stream_maximum_output_length=_LARGE_STREAM_LIMIT,
+            zlib_maximum_output_length=_LARGE_STREAM_LIMIT,
+            image_maximum_buffer_size=_LARGE_STREAM_LIMIT,
+        )
 
 
 @dataclass(frozen=True)
@@ -359,6 +392,7 @@ def optimize_pdf(
         temporary.unlink()
 
     try:
+        _raise_decompression_limits()
         writer = PdfWriter(clone_from=source)
         if _is_signature_present(writer):
             result.warnings.append("電子署名は保存時に無効になります。")
@@ -366,23 +400,7 @@ def optimize_pdf(
         if options.strip_metadata:
             result.metadata_stripped = _strip_pdf_metadata(writer)
 
-        # ponytail: trusted local drawing PDFs may contain ~79MB RGB streams;
-        # keep a finite 120MB ceiling instead of disabling decompression limits.
-        previous_stream_limit = pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH
-        previous_flate_limit = getattr(pypdf_filters, "FLATE_MAX_BUFFER_SIZE", None)
-        pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = max(
-            previous_stream_limit, _LARGE_STREAM_LIMIT
-        )
-        if previous_flate_limit is not None:
-            pypdf_filters.FLATE_MAX_BUFFER_SIZE = max(
-                previous_flate_limit, _LARGE_STREAM_LIMIT
-            )
-        try:
-            images = _collect_images(writer, result)
-        finally:
-            pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = previous_stream_limit
-            if previous_flate_limit is not None:
-                pypdf_filters.FLATE_MAX_BUFFER_SIZE = previous_flate_limit
+        images = _collect_images(writer, result)
         result.total_images = len(images) + result.skipped_inline
         page_profiles: dict[int, bool] = {}
         if options.advanced_processing:
