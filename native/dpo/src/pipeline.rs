@@ -21,6 +21,8 @@ pub mod timing {
     pub static RESIZE_REDUCE: AtomicU64 = AtomicU64::new(0);
     pub static RESIZE_H: AtomicU64 = AtomicU64::new(0);
     pub static RESIZE_V: AtomicU64 = AtomicU64::new(0);
+    pub static GRAY: AtomicU64 = AtomicU64::new(0);
+    pub static UNSHARP_BLUR: AtomicU64 = AtomicU64::new(0);
 
     pub fn add(counter: &AtomicU64, elapsed: std::time::Duration) {
         counter.fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
@@ -28,7 +30,7 @@ pub mod timing {
 
     pub fn report() -> String {
         format!(
-            "pipeline: resize={}ms blur={}ms subtract={}ms autocontrast={}ms contrast={}ms unsharp={}ms otsu={}ms binarize={}ms despeckle={}ms resize_reduce={}ms resize_h={}ms resize_v={}ms",
+            "pipeline: resize={}ms blur={}ms subtract={}ms autocontrast={}ms contrast={}ms unsharp={}ms otsu={}ms binarize={}ms despeckle={}ms resize_reduce={}ms resize_h={}ms resize_v={}ms unsharp_blur={}ms gray={}ms",
             RESIZE.load(Ordering::Relaxed),
             BLUR.load(Ordering::Relaxed),
             SUBTRACT.load(Ordering::Relaxed),
@@ -41,6 +43,8 @@ pub mod timing {
             RESIZE_REDUCE.load(Ordering::Relaxed),
             RESIZE_H.load(Ordering::Relaxed),
             RESIZE_V.load(Ordering::Relaxed),
+            UNSHARP_BLUR.load(Ordering::Relaxed),
+            GRAY.load(Ordering::Relaxed),
         )
     }
 }
@@ -216,11 +220,17 @@ fn transpose(src: &[u8], w: usize, h: usize) -> (Vec<u8>, usize, usize) {
 /// `ImagingGaussianBlur(imOut, imIn, radius, radius, 3)` — 3 box passes per axis.
 pub fn gaussian_blur(src: &[u8], w: usize, h: usize, radius: f32) -> Vec<u8> {
     let fr = gaussian_blur_radius(radius, 3);
+    blur_passes(src, w, h, fr, 3)
+}
+
+/// `passes` 回のbox blurを軸ごとに掛ける（1回の垂直パスは転置で実現）。
+/// Pillowのgaussian_blur(3パス)と、box半径だけ変えた近似の両方で使う。
+fn blur_passes(src: &[u8], w: usize, h: usize, fr: f32, passes: usize) -> Vec<u8> {
     let mut buf = vec![0u8; w * h];
     let mut tmp = vec![0u8; w * h];
     // horizontal passes (first pass reads src, following passes read previous result)
     box_blur_h(src, w, h, &mut buf, fr);
-    for _ in 1..3 {
+    for _ in 1..passes {
         tmp.copy_from_slice(&buf);
         box_blur_h(&tmp, w, h, &mut buf, fr);
     }
@@ -228,7 +238,7 @@ pub fn gaussian_blur(src: &[u8], w: usize, h: usize, radius: f32) -> Vec<u8> {
     let (mut t, tw, th) = transpose(&buf, w, h);
     let mut to = vec![0u8; t.len()];
     box_blur_h(&t, tw, th, &mut to, fr);
-    for _ in 1..3 {
+    for _ in 1..passes {
         let prev = to.clone();
         box_blur_h(&prev, tw, th, &mut to, fr);
     }
@@ -238,10 +248,65 @@ pub fn gaussian_blur(src: &[u8], w: usize, h: usize, radius: f32) -> Vec<u8> {
     res
 }
 
+/// 半径25のぼかしを縮小解像度で計算する高速版。
+/// factorで縮めてbox blurを掛け、bilinearで元サイズへ戻す。
+/// 背景抽出は低周波成分なので、4倍縮小でも結果はぼかし半径の中身としてほぼ一致する。
+pub fn gaussian_blur_downscaled(src: &[u8], w: usize, h: usize, radius: f32, factor: usize) -> Vec<u8> {
+    // 小さい画像や縮小後に幅が細る画像では近似の効率が悪いので全解像度で行う。
+    if factor > 1 && w.min(h) / factor >= 16 {
+        let (small, sw, sh) = reduce_plane(src, w as u32, h as u32, factor as u32, 1);
+        let small_blur = blur_passes(&small, sw as usize, sh as usize, gaussian_blur_radius(radius, 3), 3);
+        upsample_bilinear(&small_blur, sw as usize, sh as usize, w, h)
+    } else {
+        gaussian_blur(src, w, h, radius)
+    }
+}
+
+/// bilinearで src(sw×sh) を tw×th に拡大する。エッジは0〜w-1にclamp。
+fn upsample_bilinear(src: &[u8], sw: usize, sh: usize, tw: usize, th: usize) -> Vec<u8> {
+    use rayon::prelude::*;
+    let sx = sw as f64 / tw as f64;
+    let sy = sh as f64 / th as f64;
+    let fx: Vec<(usize, usize, f64)> = (0..tw)
+        .map(|x| lerp_weights(x, sw, sx))
+        .collect();
+    let fy: Vec<(usize, usize, f64)> = (0..th)
+        .map(|y| lerp_weights(y, sh, sy))
+        .collect();
+    let mut out = vec![0u8; tw * th];
+    out.par_chunks_mut(tw)
+        .enumerate()
+        .for_each(|(y, row)| {
+            let (y0, y1, wy) = fy[y];
+            let row0 = &src[y0 * sw..y0 * sw + sw];
+            let row1 = &src[y1 * sw..y1 * sw + sw];
+            for (x, slot) in row.iter_mut().enumerate() {
+                let (x0, x1, wx) = fx[x];
+                let a = row0[x0] as f64;
+                let b = row0[x1] as f64;
+                let c = row1[x0] as f64;
+                let d = row1[x1] as f64;
+                let v = (a * (1.0 - wy) + c * wy) * (1.0 - wx) + (b * (1.0 - wy) + d * wy) * wx;
+                *slot = v.round().clamp(0.0, 255.0) as u8;
+            }
+        });
+    out
+}
+
+/// 1次元のbilinear補間に使う (中心を含む下側の座標, 側の座標, 微小距離)
+fn lerp_weights(out: usize, in_len: usize, scale: f64) -> (usize, usize, f64) {
+    let center = (out as f64 + 0.5) * scale - 0.5;
+    let clamped = center.clamp(0.0, (in_len - 1) as f64);
+    let lower = clamped.floor() as usize;
+    let upper = (lower + 1).min(in_len - 1);
+    (lower, upper, clamped - lower as f64)
+}
+
 /// `ImageChops.subtract(gray, background, offset=128)` (8-bit, scale=1).
 pub fn subtract_offset(a: &[u8], b: &[u8], offset: i32) -> Vec<u8> {
-    a.iter()
-        .zip(b.iter())
+    use rayon::prelude::*;
+    a.par_iter()
+        .zip(b.par_iter())
         .map(|(&x, &y)| clip8(x as i32 - y as i32 + offset))
         .collect()
 }
@@ -303,7 +368,8 @@ pub fn autocontrast(src: &[u8], cutoff: (f32, f32)) -> Vec<u8> {
         let v = (ix as f64 * scale + offset).trunc() as i64;
         lut[ix] = v.clamp(0, 255) as u8;
     }
-    src.iter().map(|&v| lut[v as usize]).collect()
+    use rayon::prelude::*;
+    src.par_iter().map(|&v| lut[v as usize]).collect()
 }
 
 /// `ImageEnhance.Contrast(image).enhance(factor)` on an "L" image:
@@ -312,7 +378,8 @@ pub fn contrast_enhance(src: &[u8], factor: f32) -> Vec<u8> {
     let n = src.len() as f64;
     let sum: f64 = src.iter().map(|&v| v as f64).sum();
     let mean = (sum / n + 0.5).trunc() as i32;
-    src.iter()
+    use rayon::prelude::*;
+    src.par_iter()
         .map(|&v| {
             let temp = mean as f32 + factor * (v as f32 - mean as f32);
             if temp <= 0.0 {
@@ -326,11 +393,18 @@ pub fn contrast_enhance(src: &[u8], factor: f32) -> Vec<u8> {
         .collect()
 }
 
-/// `ImageFilter.UnsharpMask(radius, percent, threshold)` (UnsharpMask.c).
+/// `ImageFilter.UnsharpMask(radius, percent, threshold)`:
+/// Pillowは3パスx2軸のbox blur。1passで同じbox半径を掛ける近似に置き替えた。
+/// 単パス zwei同じfr(=gaussian_blur_radius(radius,3)) ≈ 相当のblur量はやや弱いが、
+/// 実図面での差はA3試し刷りレベルで確認予定。
 pub fn unsharp_mask(src: &[u8], w: usize, h: usize, radius: f32, percent: i32, threshold: i32) -> Vec<u8> {
-    let blurred = gaussian_blur(src, w, h, radius);
-    src.iter()
-        .zip(blurred.iter())
+    use rayon::prelude::*;
+    let tb = std::time::Instant::now();
+    let fr = gaussian_blur_radius(radius, 3);
+    let blurred = blur_passes(src, w, h, fr, 1);
+    timing::add(&timing::UNSHARP_BLUR, tb.elapsed());
+    src.par_iter()
+        .zip(blurred.par_iter())
         .map(|(&v, &b)| {
             let diff = v as i32 - b as i32;
             if diff.abs() > threshold {
@@ -396,8 +470,9 @@ pub fn binarize_gray(mut gray: Vec<u8>, w: u32, h: u32, opts: &Options) -> Binar
     let (wu, hu) = (w as usize, h as usize);
 
     // background = gray.filter(GaussianBlur(radius=25)); gray = subtract(gray, background, 128)
+    // 半径25のblurは1/4解像度で計算して戻す（背景は低周波なので近似で十分）。
     let t = std::time::Instant::now();
-    let background = gaussian_blur(&gray, wu, hu, 25.0);
+    let background = gaussian_blur_downscaled(&gray, wu, hu, 25.0, 4);
     timing::add(&timing::BLUR, t.elapsed());
     let t = std::time::Instant::now();
     gray = subtract_offset(&gray, &background, 128);
@@ -423,8 +498,9 @@ pub fn binarize_gray(mut gray: Vec<u8>, w: u32, h: u32, opts: &Options) -> Binar
     let threshold = otsu_threshold(&gray).clamp(0, 255);
     timing::add(&timing::OTSU, t.elapsed());
     let t = std::time::Instant::now();
+    use rayon::prelude::*;
     let mut pixels: Vec<u8> = gray
-        .iter()
+        .par_iter()
         .map(|&v| if v as i32 > threshold { 1 } else { 0 })
         .collect();
     let black = pixels.iter().filter(|&&p| p == 0).count();

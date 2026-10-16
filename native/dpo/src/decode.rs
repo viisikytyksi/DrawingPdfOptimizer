@@ -7,9 +7,12 @@ use std::io::Read;
 
 use lopdf::{Dictionary, Object};
 
-/// A decoded raster, normalised to 8-bit RGB like Pillow's `convert("RGB")`.
+/// A decoded raster. `rgb` (3チャネル・Pillowのconvert("RGB")相当) と `gray`
+/// (単チャネル) のどちらか一方を持ち、2値化パイプラインはgrayだけを使うため、
+/// グレースケールのJPEGは複製せずgrayを返す。
 pub struct Decoded {
-    pub rgb: Vec<u8>,
+    pub rgb: Option<Vec<u8>>,
+    pub gray: Option<Vec<u8>>,
     pub width: u32,
     pub height: u32,
     /// True when the source image is 1 bit per component (CCITT/G4 or 1-bit Flate).
@@ -75,31 +78,27 @@ fn decode_jpeg(data: &[u8]) -> Result<Decoded, String> {
         .ok_or_else(|| "JPEG header not decoded".to_string())?;
     let (width, height) = (info.width as u32, info.height as u32);
     let count = (width * height) as usize;
-    let rgb = match pixels.len() {
-        // 1-component JPEG: replicate the single channel, like Pillow's convert("RGB")
-        n if n == count => {
-            let mut out = Vec::with_capacity(count * 3);
-            for value in pixels {
-                out.push(value);
-                out.push(value);
-                out.push(value);
-            }
-            out
-        }
-        n if n == count * 3 => pixels,
-        n => {
-            return Err(format!(
-                "unsupported JPEG sample layout: {n} bytes for {width}x{height} (components={})",
-                info.components
-            ))
-        }
-    };
-    Ok(Decoded {
-        rgb,
-        width,
-        height,
-        one_bit: false,
-    })
+    // 1-component JPEG: convert("RGB")相当の複製をせずgrayのまま返す（2値化はgrayのみ）。
+    match pixels.len() {
+        n if n == count => Ok(Decoded {
+            rgb: None,
+            gray: Some(pixels),
+            width,
+            height,
+            one_bit: false,
+        }),
+        n if n == count * 3 => Ok(Decoded {
+            rgb: Some(pixels),
+            gray: None,
+            width,
+            height,
+            one_bit: false,
+        }),
+        n => Err(format!(
+            "unsupported JPEG sample layout: {n} bytes for {width}x{height} (components={})",
+            info.components
+        )),
+    }
 }
 
 fn decode_flate(dict: &Dictionary, data: &[u8]) -> Result<Decoded, String> {
@@ -141,9 +140,22 @@ fn decode_flate(dict: &Dictionary, data: &[u8]) -> Result<Decoded, String> {
     if width == 0 || height == 0 {
         return Err("FlateDecode image without dimensions".to_string());
     }
+    // グレースケール(1成分)と1bitはgrayのまま返す（2値化はgrayのみのため）。
+    // bit 1-8 の1成分は直接8bit grayへ展開、8bit 3/4成分などは従来のRGB経路。
+    if colors == 1 && matches!(bits, 1 | 2 | 4 | 8) {
+        let gray = samples_to_gray(&raw, width, height, bits)?;
+        return Ok(Decoded {
+            rgb: None,
+            gray: Some(gray),
+            width,
+            height,
+            one_bit: bits == 1,
+        });
+    }
     let rgb = samples_to_rgb(&raw, width, height, bits, colors)?;
     Ok(Decoded {
-        rgb,
+        rgb: Some(rgb),
+        gray: None,
         width,
         height,
         one_bit: bits == 1,
@@ -178,19 +190,17 @@ fn decode_ccitt(dict: &Dictionary, data: &[u8]) -> Result<Decoded, String> {
             return Err("CCITTFaxDecode failed".to_string());
         }
     }
-    let mut rgb = vec![255u8; (width * height) as usize * 3];
+    let mut gray = vec![255u8; (width * height) as usize];
     for (y, row) in rows.iter().take(height as usize).enumerate() {
         for (x, black) in row.iter().take(width as usize).enumerate() {
             if *black {
-                let offset = (y * width as usize + x) * 3;
-                rgb[offset] = 0;
-                rgb[offset + 1] = 0;
-                rgb[offset + 2] = 0;
+                gray[y * width as usize + x] = 0;
             }
         }
     }
     Ok(Decoded {
-        rgb,
+        rgb: None,
+        gray: Some(gray),
         width,
         height,
         one_bit: true,
@@ -217,6 +227,38 @@ fn color_components(dict: &Dictionary) -> u32 {
         },
         _ => 3,
     }
+}
+
+/// 1成分のサンプルを8bit grayへ展開する（bitsは1/2/4/8）。
+fn samples_to_gray(raw: &[u8], width: u32, height: u32, bits: u32) -> Result<Vec<u8>, String> {
+    let count = (width * height) as usize;
+    let mut out = vec![0u8; count];
+    match bits {
+        8 => {
+            if raw.len() < count {
+                return Err(format!(
+                    "FlateDecode produced {} bytes, expected {count}",
+                    raw.len()
+                ));
+            }
+            out.copy_from_slice(&raw[..count]);
+        }
+        1 | 2 | 4 => {
+            let per_byte = 8 / bits as usize;
+            let row_bytes = (width as usize * bits as usize + 7) / 8;
+            let max = (1u32 << bits) - 1;
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let byte = raw.get(y * row_bytes + x / per_byte).copied().unwrap_or(255);
+                    let shift = 8 - bits as usize - (x % per_byte) * bits as usize;
+                    let value = ((byte >> shift) & max as u8) as u32 * 255 / max;
+                    out[y * width as usize + x] = value as u8;
+                }
+            }
+        }
+        b => return Err(format!("unsupported gray layout: {b} bits x 1 colour")),
+    }
+    Ok(out)
 }
 
 /// Convert packed samples to 8-bit RGB the way Pillow's `convert("RGB")` would.
@@ -359,26 +401,36 @@ fn undo_predictor(
 }
 
 /// Composite an image over white using its soft mask, like pypdf does before the
-/// Python engine's own white compositing.
-pub fn composite_over_white(rgb: &mut [u8], mask: &Decoded) {
+/// Python engine's own white compositing. `buf`は3チャネル(rgb)でも単チャネル(gray)でも
+/// よい（channel数はchannelsとして渡す）。マスクはrgb(gray)どちらのDecodedでも読む。
+pub fn composite_over_white(buf: &mut [u8], channels: usize, mask: &Decoded) {
     if mask.width == 0 || mask.height == 0 {
         return;
     }
-    let (mw, mh) = (mask.width as usize, mask.height as usize);
-    let (iw, ih) = (rgb.len() / 3, 0);
-    let _ = ih;
-    let height = iw / (mw.max(1));
+    let mw = mask.width as usize;
+    let iw = buf.len() / channels;
+    let mask_pixels = (mask.width as usize) * (mask.height as usize);
+    let mask_channels = if mask.gray.is_some() { 1 } else { 3 };
+    let alpha_at = |index: usize| -> u32 {
+        let source = if mask_channels == 1 {
+            mask.gray.as_ref().map(|m| m.get(index ).copied().unwrap_or(255))
+        } else {
+            mask.rgb.as_ref().and_then(|m| m.get(index * 3).copied())
+        };
+        source.unwrap_or(255) as u32
+    };
+    let _ = mask_pixels;
     for index in 0..iw {
-        let (x, y) = (index % mw, index / mw);
-        if x >= mw || y >= height {
+        let x = index % mw;
+        let y = index / mw;
+        if y > (iw / mw) || (x >= mw) {
             break;
         }
-        let alpha = mask.rgb.get(index * 3).copied().unwrap_or(255) as u32;
-        for channel in 0..3 {
-            let value = rgb[index * 3 + channel] as u32;
+        let alpha = alpha_at(index);
+        for channel in 0..channels {
+            let value = buf[index * channels + channel] as u32;
             // Pillow's alpha_composite onto white: v*a/255 + 255*(1 - a/255)
-            rgb[index * 3 + channel] = ((value * alpha + 255 * (255 - alpha)) / 255) as u8;
+            buf[index * channels + channel] = ((value * alpha + 255 * (255 - alpha)) / 255) as u8;
         }
     }
-    let _ = mh;
 }

@@ -303,7 +303,14 @@ fn process_image(
         if let Ok(Object::Stream(mask)) = doc.get_object(*mask_id) {
             if let Ok(mask_image) = decode::decode(&mask.dict, &mask.content) {
                 let t_composite = Instant::now();
-                decode::composite_over_white(&mut decoded.rgb, &mask_image);
+                match decoded.rgb.as_mut() {
+                    Some(rgb) => decode::composite_over_white(rgb, 3, &mask_image),
+                    None => {
+                        if let Some(gray) = decoded.gray.as_mut() {
+                            decode::composite_over_white(gray, 1, &mask_image);
+                        }
+                    }
+                }
                 totals
                     .composite_ms
                     .fetch_add(t_composite.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -313,9 +320,21 @@ fn process_image(
     let t_ops = Instant::now();
 
     let (max_width, max_height) = pipeline::a3_pixel_box(decoded.width, decoded.height, opts.dpi);
-    // The pipeline only ever reads the R channel, so extracting gray here keeps
-    // the resized pixels byte-identical while resizing one channel instead of three.
-    let gray: Vec<u8> = decoded.rgb.iter().step_by(3).copied().collect();
+    // 2値化はgrayチャネルだけで動く。decodeでgrayが得られたものはそのまま、
+    // RGBのものはRチャネルを取り出す。画素値はどちらも従来と同一。
+    let gray: Vec<u8> = match decoded.gray.take() {
+        Some(gray) => gray,
+        None => {
+            let rgb = decoded
+                .rgb
+                .take()
+                .ok_or_else(|| "decoded image has no channel".to_string())?;
+            let t_gray = Instant::now();
+            let gray: Vec<u8> = rgb.iter().step_by(3).copied().collect();
+            pipeline::timing::add(&pipeline::timing::GRAY, t_gray.elapsed());
+            gray
+        }
+    };
     let (gray, width, height) = pipeline::resize_gray(
         &gray,
         decoded.width,
