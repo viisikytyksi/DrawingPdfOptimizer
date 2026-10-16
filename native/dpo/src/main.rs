@@ -60,7 +60,7 @@ fn usage() -> ! {
          \x20 --log-fallback-dir DIR ログを書けないときの退避先\n\
          \x20 --fullname NAME        ログに記録する氏名\n\
          \x20 --jobs N               並列数（既定 0 = 自動）\n\
-         \x20 --resize lanczos|bilinear|bicubic|nearest  縮小方式（既定 lanczos）\n\
+         \x20 --resize lanczos|bilinear|bicubic|nearest  縮小方式（既定 nearest。lanczos=Pillow互換）\n\
          \x20 --version              版数を表示"
     );
     std::process::exit(2)
@@ -84,7 +84,7 @@ fn parse_args() -> Args {
         fullname: String::new(),
         jobs: 0,
         timing: false,
-        resize_filter: pipeline::ResizeFilter::Lanczos3,
+        resize_filter: pipeline::ResizeFilter::Nearest,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {

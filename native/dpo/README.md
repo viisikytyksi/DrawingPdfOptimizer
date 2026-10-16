@@ -10,11 +10,10 @@ Shift_JIS の処理ログを Python 版と同じ形にしてあるので、`gui.
   メタデータ削除 / 未参照オブジェクトの掃除 / 重複画像の統合 /
   処理ログ(Shift_JIS, 実行開始・完了行, 退避先切替) / 進捗イベント
 - 実測（Windows11 i5-8400T、x86-64-v3ビルド、実図面84ページ/画像515点/322MB/ノイズ除去あり）:
-  **21.6〜22.0秒**。Python版(v0.8.2、同機 CPython 3.12.10 + pypdf 6.10.0 / pillow 12.2.0固定)は
-  100.1〜101.1秒で比較すると **約4.6倍速**。出力 13,839,239バイト
-  （Python版は15,715,547バイト、職場PC/m720qの両記録とバイト数一致）
-- **画素の一致**: Python版との完全一致はJPEGデコーダ差（zune-jpeg vs libjpeg）で成り立たない
-  （m720q実測: 合成タイル1.4%、実図面サンプル0.16%）。**コード・target-cpuの組合せ内では
+  **13.8秒**（既定=nearest。処理速度優先のユーザー判断で2026-10-16から既定変更。 Pillow互換の
+  lanczos指定時は21.5秒で出力13.8MB、nearestは16.9MB）
+- **画素の一致**: nearest既定のためPython版の縮小と挙動が異なる（PillowはLANCZOS）。lanczos指定時は
+  Pythonと同じアルゴリズムだがJPEGデコーダ差で完全一致しない。**コード・target-cpuの組合せ内では
   出力はビットで安定**（x86-64-v3 有無で同SHA256を確認）
 - 未完了: Windows実機(職場PC)確認 / GUI組み込み（`gui.ps1`は`dpo.exe`優先呼び出しに改修予定）
 
@@ -40,4 +39,4 @@ Windows(自己完結GNUツールチェイン)での初回ビルドは, dlltool �
 
 `--output-dir` `--dpi` `--contrast` `--threshold` `--no-auto-contrast` `--no-sharpen`
 `--denoise` `--include-small` `--keep-metadata` `--progress` `--log-dir`
-`--log-fallback-dir` `--fullname` `--jobs` `--resize lanczos|bilinear|bicubic|nearest`（既定lanczos・nearest等は比較実験用） `--timing` `--version`
+`--log-fallback-dir` `--fullname` `--jobs` `--resize lanczos|bilinear|bicubic|nearest`（**既定nearest。lanczos=Pillow互換。出力サイズはlanczosが最小**） `--timing` `--version`
