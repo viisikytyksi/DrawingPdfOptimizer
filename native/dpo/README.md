@@ -8,10 +8,11 @@ Shift_JIS の処理ログを Python 版と同じ形にしてあるので、`gui.
 - 実装済み: PDF読み書き(lopdf) / 画像XObjectの1bit CCITT G4化 / JPEG・Flate・CCITT デコード /
   SMask合成 / A3上限への縮小 / Pillow互換の2値化パイプライン / 孤立点除去 /
   メタデータ削除 / 未参照オブジェクトの掃除 / 重複画像の統合 /
-  処理ログ(Shift_JIS, 実行開始・完了行, 退避先切替) / 進捗イベント
+  処理ログ(Shift_JIS, 実行開始・完了行, 退避先切替) / 進捗イベント /
+  縮小方式切替(lanczos・bilinear・bicubic・nearest) / 画素差の視覚比較ツール(`tools/diff_render.py`, PDF表示はpypdfium2)
 - 実測（Windows11 i5-8400T、x86-64-v3ビルド、実図面84ページ/画像515点/322MB/ノイズ除去あり）:
-  **13.8秒**（既定=nearest。処理速度優先のユーザー判断で2026-10-16から既定変更。 Pillow互換の
-  lanczos指定時は21.5秒で出力13.8MB、nearestは16.9MB）
+  **10.3〜11.0秒**（既定=nearest + blur近似。2026-10-16の55bf398以降。 Pillow互換の
+  lanczos指定時は21.5秒で出力13.8MB、nearest旧blurは13.8秒/16.9MB）
 - **画素の一致**: nearest既定のためPython版の縮小と挙動が異なる（PillowはLANCZOS）。lanczos指定時は
   Pythonと同じアルゴリズムだがJPEGデコーダ差で完全一致しない。**コード・target-cpuの組合せ内では
   出力はビットで安定**（x86-64-v3 有無で同SHA256を確認）

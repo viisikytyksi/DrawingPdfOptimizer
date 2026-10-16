@@ -2,7 +2,8 @@
 # 実体はリポジトリに入れず、配布zip側で持つ。SnipOCR の dist/tesseract/ と同じ方針。
 # 再構成の手順は README.md の「ランタイムの再構成」を参照。
 /runtime/
-/tools/
+# tools/ は追跡する（2026-10-16: diff_render.py を追加。セッション用の動的スクリプトは置かない）
+/tools/sessions/
 /validation-output/
 
 # Python
