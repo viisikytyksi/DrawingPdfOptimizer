@@ -40,6 +40,7 @@ struct Args {
     fullname: String,
     jobs: usize,
     timing: bool,
+    resize_filter: pipeline::ResizeFilter,
 }
 
 fn usage() -> ! {
@@ -59,6 +60,7 @@ fn usage() -> ! {
          \x20 --log-fallback-dir DIR ログを書けないときの退避先\n\
          \x20 --fullname NAME        ログに記録する氏名\n\
          \x20 --jobs N               並列数（既定 0 = 自動）\n\
+         \x20 --resize lanczos|bilinear|bicubic|nearest  縮小方式（既定 lanczos）\n\
          \x20 --version              版数を表示"
     );
     std::process::exit(2)
@@ -82,6 +84,7 @@ fn parse_args() -> Args {
         fullname: String::new(),
         jobs: 0,
         timing: false,
+        resize_filter: pipeline::ResizeFilter::Lanczos3,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -112,6 +115,16 @@ fn parse_args() -> Args {
             "--fullname" => args.fullname = value(),
             "--jobs" => args.jobs = value().parse().unwrap_or(0),
             "--timing" => args.timing = true,
+            "--resize" => {
+                let mode = value();
+                args.resize_filter = match mode.as_str() {
+                    "lanczos" => pipeline::ResizeFilter::Lanczos3,
+                    "bilinear" => pipeline::ResizeFilter::Bilinear,
+                    "bicubic" => pipeline::ResizeFilter::Bicubic,
+                    "nearest" => pipeline::ResizeFilter::Nearest,
+                    _ => usage(),
+                };
+            }
             "--version" | "-V" => {
                 println!("{VERSION}");
                 std::process::exit(0)
@@ -309,6 +322,7 @@ fn process_image(
         decoded.height,
         max_width,
         max_height,
+        opts.resize_filter,
     );
     let binary = pipeline::binarize_gray(gray, width, height, opts);
     totals
@@ -591,6 +605,7 @@ fn process_file(
         contrast: args.contrast,
         sharpen: args.sharpen,
         denoise: args.denoise,
+        resize_filter: args.resize_filter,
         ..Default::default()
     };
 

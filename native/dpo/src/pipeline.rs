@@ -57,6 +57,8 @@ pub struct Options {
     pub denoise: bool,
     pub min_long_side: u32,
     pub min_pixels: u64,
+    /// 比較実験用の縮小フィルタ（既定は Pillow 互換の Lanczos3）。
+    pub resize_filter: ResizeFilter,
 }
 
 impl Default for Options {
@@ -69,6 +71,7 @@ impl Default for Options {
             denoise: true,
             min_long_side: MIN_LONG_SIDE,
             min_pixels: MIN_PIXELS,
+            resize_filter: ResizeFilter::Lanczos3,
         }
     }
 }
@@ -554,18 +557,35 @@ fn despeckle_pass(pixels: &mut [u8], w: usize, h: usize, min_neighbours: u32) {
     }
 }
 
-pub fn resize_gray(gray: &[u8], w: u32, h: u32, max_w: u32, max_h: u32) -> (Vec<u8>, u32, u32) {
+pub fn resize_gray(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    max_w: u32,
+    max_h: u32,
+    filter: ResizeFilter,
+) -> (Vec<u8>, u32, u32) {
     let started = std::time::Instant::now();
     // planes = 1: the pipeline only ever reads the R channel of the resized RGB,
     // so resizing the single channel produces byte-identical input to
     // `_prepare_image` while doing a third of the arithmetic.
-    let result = resize_plane(gray, w, h, max_w, max_h, 1);
+    let result = resize_plane(gray, w, h, max_w, max_h, 1, filter);
     timing::add(&timing::RESIZE, started.elapsed());
     result
 }
 
 /// Lanczos3 downscale, mirroring `Image.thumbnail(max_size, LANCZOS)`.
-fn resize_plane(src: &[u8], w: u32, h: u32, max_w: u32, max_h: u32, planes: usize) -> (Vec<u8>, u32, u32) {
+/// bilinear/bicubic は(目測比較用の)カーネル差し替え、nearest は点サンプリング。
+/// target sizeの計算はいずれも thumbnail と同じ。
+fn resize_plane(
+    src: &[u8],
+    w: u32,
+    h: u32,
+    max_w: u32,
+    max_h: u32,
+    planes: usize,
+    filter: ResizeFilter,
+) -> (Vec<u8>, u32, u32) {
     if w <= max_w && h <= max_h {
         return (src.to_vec(), w, h);
     }
@@ -581,6 +601,12 @@ fn resize_plane(src: &[u8], w: u32, h: u32, max_w: u32, max_h: u32, planes: usiz
         });
         (max_w, y)
     };
+    if filter == ResizeFilter::Nearest {
+        let started = std::time::Instant::now();
+        let out = nearest_plane(src, w, h, tw, th, planes);
+        timing::add(&timing::RESIZE_H, started.elapsed());
+        return (out, tw, th);
+    }
 
     // Two steps, like Pillow's `thumbnail(..., reducing_gap=2.0)`: an integer box
     // reduction first (cheap, and it antialiases), then Lanczos3 on an image that
@@ -600,7 +626,102 @@ fn resize_plane(src: &[u8], w: u32, h: u32, max_w: u32, max_h: u32, planes: usiz
     if sw == tw && sh == th {
         return (source, tw, th);
     }
-    (lanczos3_plane(&source, sw, sh, tw, th, planes), tw, th)
+    (resample_plane(&source, sw, sh, tw, th, planes, filter), tw, th)
+}
+
+/// エンジンの縮小フィルタ。既定は Pillow 互換の Lanczos3。
+/// bilinear/bicubic は分離カーネルの support と重みを替えて同じ2段構成で回す。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeFilter {
+    /// Pillow 互換（thumbnail LANCZOS）
+    Lanczos3,
+    /// Catmull-Rom 係数の cubic（support 2）
+    Bicubic,
+    /// 三角（support 1）
+    Bilinear,
+    /// 比較実験用の点サンプリング
+    Nearest,
+}
+
+impl ResizeFilter {
+    fn support(self) -> f64 {
+        match self {
+            ResizeFilter::Lanczos3 => 3.0,
+            ResizeFilter::Bicubic => 2.0,
+            ResizeFilter::Bilinear => 1.0,
+            ResizeFilter::Nearest => 0.5,
+        }
+    }
+    fn weight(self, x: f64) -> f64 {
+        match self {
+            ResizeFilter::Lanczos3 => lanczos(x),
+            ResizeFilter::Bicubic => bicubic(x),
+            ResizeFilter::Bilinear => bilinear(x),
+            ResizeFilter::Nearest => 1.0,
+        }
+    }
+}
+
+/// Pillow ImageTransformResample.BICUBIC の cubic spline 係数（a = -0.5）
+fn bicubic(x: f64) -> f64 {
+    let x = x.abs();
+    if x >= 2.0 {
+        return 0.0;
+    }
+    if x < 1e-9 {
+        return 1.0;
+    }
+    let a = -0.5;
+    if x <= 1.0 {
+        let x2 = x * x;
+        (a + 2.0) * x * x2 - (a + 3.0) * x2 + 1.0
+    } else {
+        let x2 = x * x;
+        a * x * x2 - 5.0 * a * x2 + 8.0 * a * x - 4.0 * a
+    }
+}
+
+/// Pillow ImageTransformResample.BILINEAR の三角重み
+fn bilinear(x: f64) -> f64 {
+    let x = x.abs();
+    if x >= 1.0 {
+        return 0.0;
+    }
+    1.0 - x
+}
+
+/// 比較実験用: 中心準拠のnearest-neighbor点サンプリング。
+/// x=(sx+0.5)*scale-0.5 を四捨五入して丸め、clampして1画素だけ採る。
+fn nearest_plane(src: &[u8], w: u32, h: u32, tw: u32, th: u32, planes: usize) -> Vec<u8> {
+    use rayon::prelude::*;
+    let (wu, hu, twu, thu) = (w as usize, h as usize, tw as usize, th as usize);
+    let sx = twu as f64 / wu as f64;
+    let sy = thu as f64 / hu as f64;
+    let x_of: Vec<usize> = (0..twu)
+        .map(|out| {
+            let v = (((out as f64 + 0.5) / sx - 0.5).round()) as i64;
+            v.clamp(0, wu as i64 - 1) as usize
+        })
+        .collect();
+    let y_of: Vec<usize> = (0..thu)
+        .map(|out| {
+            let v = (((out as f64 + 0.5) / sy - 0.5).round()) as i64;
+            v.clamp(0, hu as i64 - 1) as usize
+        })
+        .collect();
+    let out_w = twu * planes;
+    let mut out = vec![0u8; out_w * thu];
+    out.par_chunks_mut(out_w)
+        .enumerate()
+        .for_each(|(ty, out_row)| {
+            let y = y_of[ty] * wu * planes;
+            for tx in 0..twu {
+                let base = y + x_of[tx] * planes;
+                out_row[tx * planes..(tx + 1) * planes]
+                    .copy_from_slice(&src[base..base + planes]);
+            }
+        });
+    out
 }
 
 /// Pillow's `Image.reduce(factor)`: average factor x factor blocks (rounded).
@@ -637,11 +758,19 @@ fn reduce_plane(src: &[u8], w: u32, h: u32, factor: u32, planes: usize) -> (Vec<
 /// Separable Lanczos3 with precomputed coefficients (no sin() in the inner loop),
 /// parallel over rows.  Per-channel arithmetic is identical for every plane
 /// count, so the single-channel pipeline keeps Pillow's sums bit-for-bit.
-fn lanczos3_plane(src: &[u8], w: u32, h: u32, tw: u32, th: u32, planes: usize) -> Vec<u8> {
+fn resample_plane(
+    src: &[u8],
+    w: u32,
+    h: u32,
+    tw: u32,
+    th: u32,
+    planes: usize,
+    filter: ResizeFilter,
+) -> Vec<u8> {
     use rayon::prelude::*;
     let (wu, hu, twu, thu) = (w as usize, h as usize, tw as usize, th as usize);
-    let (h_starts, h_weights) = build_weights(wu, twu);
-    let (v_starts, v_weights) = build_weights(hu, thu);
+    let (h_starts, h_weights) = build_weights(wu, twu, filter);
+    let (v_starts, v_weights) = build_weights(hu, thu, filter);
 
     let started_h = std::time::Instant::now();
     let mut horizontal = vec![0u8; twu * hu * planes];
@@ -693,9 +822,13 @@ fn lanczos3_plane(src: &[u8], w: u32, h: u32, tw: u32, th: u32, planes: usize) -
     out
 }
 
-fn build_weights(in_len: usize, out_len: usize) -> (Vec<usize>, Vec<Vec<f64>>) {
+fn build_weights(
+    in_len: usize,
+    out_len: usize,
+    filter: ResizeFilter,
+) -> (Vec<usize>, Vec<Vec<f64>>) {
     let scale = out_len as f64 / in_len as f64;
-    let support = (3.0 / scale).max(1.0);
+    let support = (filter.support() / scale).max(1.0);
     let mut starts = Vec::with_capacity(out_len);
     let mut table = Vec::with_capacity(out_len);
     for index in 0..out_len {
@@ -707,7 +840,7 @@ fn build_weights(in_len: usize, out_len: usize) -> (Vec<usize>, Vec<Vec<f64>>) {
         let mut weights = Vec::with_capacity(end - start + 1);
         let mut total = 0.0;
         for source in start..=end {
-            let weight = lanczos((source as f64 - center) / support);
+            let weight = filter.weight((source as f64 - center) / support);
             weights.push(weight);
             total += weight;
         }
@@ -859,11 +992,11 @@ mod tests {
             if tw >= mw && th >= mh {
                 continue;
             }
-            let (a, w1, h1) = resize_plane(&rgb, mw as u32, mh as u32, tw as u32, th as u32, 3);
+            let (a, w1, h1) = resize_plane(&rgb, mw as u32, mh as u32, tw as u32, th as u32, 3, ResizeFilter::Lanczos3);
             if tw == mw && th == mh {
                 continue;
             }
-            let (b, w2, h2) = resize_plane(&p, mw as u32, mh as u32, tw as u32, th as u32, 1);
+            let (b, w2, h2) = resize_plane(&p, mw as u32, mh as u32, tw as u32, th as u32, 1, ResizeFilter::Lanczos3);
             assert_eq!((w1, h1), (w2, h2));
             for ((ra, rb)) in a.chunks_exact(3).zip(b.iter()) {
                 assert_eq!(ra[0], *rb, "Rチャネルの不一致 tw={} th={}", tw, th);
