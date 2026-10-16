@@ -40,4 +40,4 @@ Windows(自己完結GNUツールチェイン)での初回ビルドは, dlltool �
 
 `--output-dir` `--dpi` `--contrast` `--threshold` `--no-auto-contrast` `--no-sharpen`
 `--denoise` `--include-small` `--keep-metadata` `--progress` `--log-dir`
-`--log-fallback-dir` `--fullname` `--jobs` `--timing` `--version`
+`--log-fallback-dir` `--fullname` `--jobs` `--resize lanczos|bilinear|bicubic|nearest`（既定lanczos・nearest等は比較実験用） `--timing` `--version`
